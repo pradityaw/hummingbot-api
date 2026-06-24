@@ -1,0 +1,6 @@
+services:
+  hummingbot-api:
+    image: hummingbot/hummingbot-api:hyperliquid-fix
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8

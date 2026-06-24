@@ -3,7 +3,7 @@ import os
 import shutil
 import threading
 import time
-from typing import Dict
+from typing import Dict, List
 
 import docker
 from docker.errors import DockerException
@@ -161,6 +161,11 @@ class DockerService:
         except DockerException as e:
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _bot_container_dns_servers() -> List[str]:
+        raw = os.environ.get("HBOT_BOT_DNS_SERVERS", "1.1.1.1,8.8.8.8")
+        return [server.strip() for server in raw.split(",") if server.strip()]
+
     def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
@@ -274,18 +279,25 @@ class DockerService:
                 'max-size': '10m',
                 'max-file': "5",
             })
+        dns_servers = self._bot_container_dns_servers()
+        container_config = {
+            "image": config.image,
+            "name": instance_name,
+            "volumes": volumes,
+            "environment": environment,
+            "network_mode": "host",
+            "restart_policy": {"Name": "unless-stopped"},
+            "detach": True,
+            "tty": True,
+            "stdin_open": True,
+            "log_config": log_config,
+        }
+        if dns_servers:
+            container_config["dns"] = dns_servers
+            logger.info(f"Launching bot {instance_name} with DNS servers: {dns_servers}")
+
         try:
-            self.client.containers.run(
-                image=config.image,
-                name=instance_name,
-                volumes=volumes,
-                environment=environment,
-                network_mode="host",
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                log_config=log_config,
-            )
+            self.client.containers.run(**container_config)
             return {"success": True, "message": f"Instance {instance_name} created successfully."}
         except docker.errors.DockerException as e:
             return {"success": False, "message": str(e)}
