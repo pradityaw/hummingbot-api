@@ -1,6 +1,10 @@
 .PHONY: setup run deploy stop install uninstall build install-pre-commit tailscale-status
 
 SETUP_SENTINEL := .setup-complete
+COMPOSE_FILES := -f docker-compose.yml
+ifneq ("$(wildcard docker-compose.hyperliquid-fix.yml)","")
+COMPOSE_FILES += -f docker-compose.hyperliquid-fix.yml
+endif
 
 setup: $(SETUP_SENTINEL)
 
@@ -12,7 +16,7 @@ $(SETUP_SENTINEL):
 # When TAILSCALE_ENABLED=true: installs Tailscale if needed, connects, configures tailscale serve,
 # then binds uvicorn to 127.0.0.1 only (tailscale serve exposes port 8000 on the tailnet)
 run:
-	docker compose up emqx postgres -d
+	docker compose $(COMPOSE_FILES) up emqx postgres -d
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ "$${TAILSCALE_ENABLED:-false}" = "true" ]; then \
 		echo "[INFO] Tailscale mode: setting up Tailscale for source install..."; \
@@ -38,9 +42,12 @@ deploy: $(SETUP_SENTINEL)
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ "$${TAILSCALE_ENABLED:-false}" = "true" ]; then \
 		echo "[INFO] Deploying with Tailscale sidecar..."; \
-		docker compose -f docker-compose.yml -f docker-compose.tailscale.yml up -d; \
+		docker compose $(COMPOSE_FILES) -f docker-compose.tailscale.yml up -d; \
+	elif [ "$${VPS_LOCALHOST_ENABLED:-false}" = "true" ]; then \
+		echo "[INFO] Deploying with VPS localhost-only port bindings..."; \
+		docker compose $(COMPOSE_FILES) -f docker-compose.vps-localhost.yml up -d; \
 	else \
-		docker compose up -d; \
+		docker compose $(COMPOSE_FILES) up -d; \
 	fi
 
 TAILSCALE_CONTAINER := hummingbot-tailscale
@@ -62,7 +69,7 @@ tailscale-status:
 
 # Stop all services
 stop:
-	docker compose down
+	docker compose $(COMPOSE_FILES) down
 
 # Install conda environment
 install:

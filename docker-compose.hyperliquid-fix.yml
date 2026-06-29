@@ -1,6 +1,8 @@
 services:
   hummingbot-api:
     image: hummingbot/hummingbot-api:hyperliquid-fix
+    # Applies to the API service. Bot containers launched by the API use
+    # network_mode: host, where Docker DNS settings may be ineffective.
     dns:
       - 1.1.1.1
       - 8.8.8.8

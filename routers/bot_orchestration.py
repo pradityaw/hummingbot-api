@@ -1,8 +1,13 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
+import sqlite3
 from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
@@ -18,6 +23,177 @@ from utils.file_system import fs_util
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Bot Orchestration"], prefix="/bot-orchestration")
+
+ACTIVE_ORDER_STATUSES = {
+    "BuyOrderCreated",
+    "SellOrderCreated",
+    "OrderCreated",
+    "OPEN",
+    "PENDING_CREATE",
+    "PENDING_CANCEL",
+    "PARTIALLY_FILLED",
+}
+
+BOT_DB_DECIMAL_SCALE = Decimal("1000000")
+
+
+def _bot_instance_dir(bot_name: str) -> Path:
+    return Path("bots") / "instances" / bot_name
+
+
+def _bot_sqlite_path(bot_name: str) -> Path:
+    return _bot_instance_dir(bot_name) / "data" / f"{bot_name}.sqlite"
+
+
+def _bot_connectivity_dir(bot_name: str) -> Path:
+    return _bot_instance_dir(bot_name) / "data" / "connectivity"
+
+
+def _bot_connectivity_state_path(bot_name: str) -> Path:
+    return _bot_connectivity_dir(bot_name) / "runtime_connectivity_state.json"
+
+
+def _bot_connectivity_events_path(bot_name: str) -> Path:
+    return _bot_connectivity_dir(bot_name) / "runtime_connectivity_events.jsonl"
+
+
+def _read_json_path(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _connectivity_from_status(status: dict) -> Optional[dict]:
+    for report in status.get("performance", {}).values():
+        custom_info = report.get("custom_info", {}) if isinstance(report, dict) else {}
+        connectivity = custom_info.get("runtime_connectivity")
+        if connectivity:
+            return connectivity
+    return None
+
+
+def _read_bot_connectivity_state(bot_name: str, status: Optional[dict] = None) -> dict:
+    payload = _read_json_path(_bot_connectivity_state_path(bot_name))
+    if payload is not None:
+        return payload
+    if status is not None:
+        payload = _connectivity_from_status(status)
+        if payload is not None:
+            return payload
+    return {
+        "current_state": "UNKNOWN",
+        "reason": "runtime_connectivity_state_unavailable",
+        "readiness_reason": "runtime_connectivity_state_unavailable",
+        "watchdog_reason": "runtime_connectivity_state_unavailable",
+        "quoting_enabled": False,
+    }
+
+
+def _read_bot_connectivity_events(bot_name: str, limit: int) -> list:
+    path = _bot_connectivity_events_path(bot_name)
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _normalize_db_decimal(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    return format((Decimal(value) / BOT_DB_DECIMAL_SCALE).normalize(), "f")
+
+
+def _read_bot_orders_from_sqlite(bot_name: str, active_only: bool, limit: int) -> dict:
+    sqlite_path = _bot_sqlite_path(bot_name)
+    if not sqlite_path.exists():
+        raise HTTPException(status_code=404, detail=f"Order database not found for bot '{bot_name}'")
+
+    status_filter = ""
+    params = []
+    if active_only:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        status_filter = f"where last_status in ({placeholders})"
+        params.extend(sorted(ACTIVE_ORDER_STATUSES))
+    params.append(limit)
+
+    query = f"""
+        select
+            id,
+            config_file_path,
+            strategy,
+            market,
+            symbol,
+            base_asset,
+            quote_asset,
+            creation_timestamp,
+            order_type,
+            amount,
+            leverage,
+            price,
+            last_status,
+            last_update_timestamp,
+            exchange_order_id,
+            position
+        from "Order"
+        {status_filter}
+        order by creation_timestamp desc, last_update_timestamp desc
+        limit ?
+    """
+
+    with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+        total_orders = conn.execute('select count(*) from "Order"').fetchone()[0]
+        active_orders = conn.execute(
+            f'select count(*) from "Order" where last_status in ({",".join("?" for _ in ACTIVE_ORDER_STATUSES)})',
+            sorted(ACTIVE_ORDER_STATUSES),
+        ).fetchone()[0]
+
+    orders = []
+    for row in rows:
+        order = dict(row)
+        order["amount_normalized"] = _normalize_db_decimal(order.get("amount"))
+        order["price_normalized"] = _normalize_db_decimal(order.get("price"))
+        orders.append(order)
+
+    return {
+        "sqlite_path": str(sqlite_path),
+        "active_only": active_only,
+        "total_orders": total_orders,
+        "active_order_count": active_orders,
+        "orders": orders,
+    }
+
+
+def _extract_recent_order_events(bot_name: str, limit: int) -> list:
+    log_path = _bot_instance_dir(bot_name) / "logs" / f"logs_{bot_name}.log"
+    if not log_path.exists():
+        return []
+
+    events = []
+    with log_path.open("r", encoding="utf-8", errors="replace") as log_file:
+        for line in log_file:
+            marker = "EVENT_LOG - "
+            if marker not in line:
+                continue
+            try:
+                event = json.loads(line.split(marker, 1)[1])
+            except json.JSONDecodeError:
+                continue
+            event_name = event.get("event_name", "")
+            if "Order" in event_name:
+                events.append(event)
+
+    return events[-limit:]
 
 
 @router.get("/status")
@@ -149,6 +325,98 @@ def get_bot_status(bot_name: str, bots_manager: BotsOrchestrator = Depends(get_b
     return {
         "status": "success",
         "data": response
+    }
+
+
+@router.get("/{bot_name}/health")
+def get_bot_health(bot_name: str, bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator)):
+    """
+    Get a compact operational health view for one bot.
+    """
+    status = bots_manager.get_bot_status(bot_name)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    orders = _read_bot_orders_from_sqlite(bot_name, active_only=True, limit=20)
+    connectivity = _read_bot_connectivity_state(bot_name, status)
+    return {
+        "status": "success",
+        "data": {
+            "bot_name": bot_name,
+            "bot_status": status.get("status"),
+            "recently_active": status.get("recently_active", False),
+            "error_log_count": len(status.get("error_logs", [])),
+            "general_log_count": len(status.get("general_logs", [])),
+            "controllers": list(status.get("performance", {}).keys()),
+            "active_order_count": orders["active_order_count"],
+            "order_database": orders["sqlite_path"],
+            "source": bots_manager.active_bots.get(bot_name, {}).get("source", "unknown"),
+            "connectivity": connectivity,
+            "readiness_reason": connectivity.get("readiness_reason"),
+            "watchdog_reason": connectivity.get("watchdog_reason"),
+            "quoting_enabled": connectivity.get("quoting_enabled", False),
+        },
+    }
+
+
+@router.get("/{bot_name}/connectivity")
+def get_bot_connectivity(bot_name: str, bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator)):
+    status = bots_manager.get_bot_status(bot_name)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Bot not found")
+    return {
+        "status": "success",
+        "data": {
+            "bot_name": bot_name,
+            "connectivity": _read_bot_connectivity_state(bot_name, status),
+        },
+    }
+
+
+@router.get("/{bot_name}/connectivity/events")
+def get_bot_connectivity_events(
+    bot_name: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+    bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator),
+):
+    status = bots_manager.get_bot_status(bot_name)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Bot not found")
+    return {
+        "status": "success",
+        "data": {
+            "bot_name": bot_name,
+            "events": _read_bot_connectivity_events(bot_name, limit),
+        },
+    }
+
+
+@router.get("/{bot_name}/orders")
+def get_bot_orders(
+    bot_name: str,
+    active_only: bool = True,
+    limit: int = Query(default=20, ge=1, le=200),
+    event_limit: int = Query(default=20, ge=0, le=200),
+    bots_manager: BotsOrchestrator = Depends(get_bots_orchestrator),
+):
+    """
+    Inspect orders recorded by a running Hummingbot instance.
+
+    This is bot-scoped and reads the instance recorder database, so it can see
+    orders created by headless controller bots that are not owned by the API's
+    account-level connector cache.
+    """
+    if bot_name not in bots_manager.active_bots:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    orders = _read_bot_orders_from_sqlite(bot_name, active_only=active_only, limit=limit)
+    return {
+        "status": "success",
+        "data": {
+            "bot_name": bot_name,
+            **orders,
+            "recent_order_events": _extract_recent_order_events(bot_name, event_limit),
+        },
     }
 
 

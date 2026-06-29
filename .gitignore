@@ -176,6 +176,16 @@ bots/conf/
 # Local MCP configuration (project-specific overrides)
 .mcp.json
 
+# Local connector credential staging files
+.hyperliquid*_credentials.json
+
+# Local API database and ops runtime artifacts
+database/*.db
+ops/*.log
+ops/*.state
+ops/hyperliquid-probes/
+ops/watchdog-status/
+
 # IDE files
 .vscode/
 .idea/

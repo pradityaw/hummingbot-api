@@ -280,6 +280,9 @@ class DockerService:
                 'max-file': "5",
             })
         dns_servers = self._bot_container_dns_servers()
+        # Bot containers run in host networking mode for connector behavior. Docker's
+        # per-container DNS setting is kept for compatibility, but host resolver
+        # settings may still be the effective DNS source on some Docker engines.
         container_config = {
             "image": config.image,
             "name": instance_name,

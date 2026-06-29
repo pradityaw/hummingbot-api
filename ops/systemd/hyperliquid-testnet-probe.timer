@@ -1,0 +1,11 @@
+[Unit]
+Description=Run passive Hyperliquid testnet probe every two minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=hyperliquid-testnet-probe.service
+
+[Install]
+WantedBy=timers.target

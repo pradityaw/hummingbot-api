@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hummingbot Hyperliquid PMM watchdog every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=hummingbot-hl-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -2,6 +2,7 @@ services:
   hummingbot-api:
     container_name: hummingbot-api
     image: hummingbot/hummingbot-api:latest
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
@@ -37,7 +38,16 @@ services:
     networks:
       - emqx-bridge
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/', timeout=5).read()\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
   emqx:
     container_name: hummingbot-broker
     image: emqx:5
@@ -57,7 +67,7 @@ services:
       - "8883:8883"  # mqtt:tcp:ssl
       - "8083:8083"  # mqtt:ws
       - "8084:8084"  # mqtt:ws:ssl
-      - "8081:8081"  # http:management
+      - "18081:8081"  # http:management
       - "18083:18083"  # http:dashboard
       - "61613:61613"  # web-stomp gateway
     networks:

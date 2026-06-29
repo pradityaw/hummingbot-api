@@ -9,6 +9,11 @@ from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2Confi
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
+try:
+    from scripts.connectivity_resilience import RuntimeConnectivityGuard
+except ModuleNotFoundError:
+    from connectivity_resilience import RuntimeConnectivityGuard
+
 
 class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
@@ -37,8 +42,18 @@ class V2WithControllers(StrategyV2Base):
         self.drawdown_exited_controllers = []
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
+        self.connectivity_guard = RuntimeConnectivityGuard(connectors=self.connectors)
 
     def on_tick(self):
+        connectivity_snapshot = self.connectivity_guard.evaluate(self.current_timestamp)
+        if not connectivity_snapshot.quoting_enabled:
+            self.connectivity_guard.apply_safety_actions(
+                executors=self.get_all_executors(),
+                executor_orchestrator=self.executor_orchestrator,
+                stop_action_cls=StopExecutorAction,
+            )
+            self.send_performance_report()
+            return
         super().on_tick()
         if not self._is_stop_triggered:
             self.check_manual_kill_switch()
@@ -90,9 +105,11 @@ class V2WithControllers(StrategyV2Base):
         Get the full report for a controller including performance and custom info.
         """
         performance_report = self.controller_reports.get(controller_id, {}).get("performance")
+        custom_info = self.controllers[controller_id].get_custom_info() or {}
+        custom_info["runtime_connectivity"] = self.connectivity_guard.current_state_payload()
         return {
             "performance": performance_report.dict() if performance_report else {},
-            "custom_info": self.controllers[controller_id].get_custom_info()
+            "custom_info": custom_info
         }
 
     def send_performance_report(self):

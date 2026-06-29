@@ -1,0 +1,5 @@
+FROM hummingbot/hummingbot:latest
+
+COPY patch_hyperliquid_connector.py /tmp/patch_hyperliquid_connector.py
+COPY overrides /tmp/overrides
+RUN python /tmp/patch_hyperliquid_connector.py

@@ -1,0 +1,24 @@
+{
+  "data": {
+    "connectivity": {
+      "current_state": "HARD_DISCONNECTED",
+      "reason": "websocket_hard_disconnected,rest_unavailable",
+      "public_ws_status": "closed",
+      "private_user_ws_status": "closed",
+      "rest_health": "unhealthy",
+      "last_order_book_update_timestamp": 1781773800,
+      "last_user_stream_update_timestamp": 1781773800,
+      "reconnect_attempt_count": 5,
+      "reconnect_duration": 10.5,
+      "ws_close_code": "1006",
+      "ws_close_reason": "WSServerHandshakeError: 502",
+      "open_order_count_during_disconnect": 2,
+      "open_order_count": 2,
+      "reconciliation_result": "required",
+      "readiness_reason": "websocket_hard_disconnected,rest_unavailable",
+      "watchdog_reason": "websocket_hard_disconnected,rest_unavailable",
+      "quoting_enabled": false,
+      "orders_unknown": true
+    }
+  }
+}

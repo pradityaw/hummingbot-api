@@ -1,0 +1,9 @@
+[Unit]
+Description=Passive Hyperliquid testnet connectivity probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/hummingbot-api
+ExecStart=/usr/bin/python3 /root/hummingbot-api/ops/probe_hyperliquid_testnet.py

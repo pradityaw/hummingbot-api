@@ -1,0 +1,16 @@
+FROM hummingbot/hummingbot-api:latest
+
+WORKDIR /hummingbot-api
+
+COPY main.py config.py deps.py ./
+COPY models ./models
+COPY routers ./routers
+COPY services ./services
+COPY utils ./utils
+COPY database ./database
+COPY bots/controllers ./bots/controllers
+COPY bots/scripts ./bots/scripts
+
+COPY docker/hyperliquid-patch/patch_hyperliquid_connector.py /tmp/patch_hyperliquid_connector.py
+COPY docker/hyperliquid-patch/overrides /tmp/overrides
+RUN python /tmp/patch_hyperliquid_connector.py

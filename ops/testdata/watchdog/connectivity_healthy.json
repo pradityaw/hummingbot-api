@@ -1,0 +1,24 @@
+{
+  "data": {
+    "connectivity": {
+      "current_state": "HEALTHY",
+      "reason": "ok",
+      "public_ws_status": "connected",
+      "private_user_ws_status": "connected",
+      "rest_health": "healthy",
+      "last_order_book_update_timestamp": 1781773860,
+      "last_user_stream_update_timestamp": 1781773860,
+      "reconnect_attempt_count": 2,
+      "reconnect_duration": 0.25,
+      "ws_close_code": "1006",
+      "ws_close_reason": "recovered",
+      "open_order_count_during_disconnect": 2,
+      "open_order_count": 0,
+      "reconciliation_result": "succeeded",
+      "readiness_reason": "ok",
+      "watchdog_reason": "ok",
+      "quoting_enabled": true,
+      "orders_unknown": false
+    }
+  }
+}
