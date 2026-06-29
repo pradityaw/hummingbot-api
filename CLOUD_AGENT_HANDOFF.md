@@ -174,19 +174,37 @@ Start with read-only VPS audit, then proceed through gated steps with user confi
 
 ## Workspace setup for Cloud Agent
 
-**Minimum (engineering only):** Open `/Users/dubski/hummingbot-api` on branch `cursor-hyperliquid-recovery-hardening`.
+### Option A — Cloud Agent (recommended)
 
-**Full (ops + configs):** Open multi-root workspace `hyperliquid-condor-mm.code-workspace` in hyperliquid-condor-mm repo (includes hummingbot-api path if configured locally).
+1. In Cursor, start a **Cloud Agent**
+2. Point it at: `https://github.com/pradityaw/hummingbot-api`
+3. Branch: `cursor-hyperliquid-recovery-hardening`
+4. Paste the cloud agent prompt from below
+5. Add secrets if needed:
+   - SSH private key for VPS (`168.144.111.10`)
+   - Hummingbot API credentials (`admin` / your password)
 
-**VPS access:** Cloud agent needs SSH key `~/.ssh/id_ed25519` and network to `168.144.111.10`. Configure secrets/env in Cursor Cloud if SSH is not available by default.
+For umbrella configs, open a second cloud session or add multi-repo context from:
+`https://github.com/pradityaw/hyperliquid-condor-mm` (same branch).
 
----
+### Option B — Cursor Desktop (local)
 
-## Push / fork note
+Open branch `cursor-hyperliquid-recovery-hardening` in `/Users/dubski/hummingbot-api`, or open `hyperliquid-condor-mm.code-workspace` for both repos.
 
-If `origin` is upstream `hummingbot/hummingbot-api`, push the branch to **your fork** and point Cursor Cloud at that fork URL:
+**VPS access:** Cloud agent needs SSH to `168.144.111.10` via `~/.ssh/id_ed25519`.
+
+Branch is published on the user fork:
+
+- **hummingbot-api:** https://github.com/pradityaw/hummingbot-api/tree/cursor-hyperliquid-recovery-hardening
+- **hyperliquid-condor-mm:** https://github.com/pradityaw/hyperliquid-condor-mm/tree/cursor-hyperliquid-recovery-hardening
+
+Local remotes:
 
 ```bash
-git remote add fork git@github.com:<YOUR_USER>/hummingbot-api.git  # if needed
+# hummingbot-api
+git remote add fork https://github.com/pradityaw/hummingbot-api.git  # if missing
 git push -u fork cursor-hyperliquid-recovery-hardening
+
+# hyperliquid-condor-mm
+git push -u origin cursor-hyperliquid-recovery-hardening
 ```
