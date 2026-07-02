@@ -78,6 +78,8 @@ def guard_for(
     reconnect_required_stable_seconds=10,
     reconciliation_max_retries=3,
     reconciliation_retry_backoff_seconds=5,
+    rate_limit_unsafe_threshold=3,
+    max_open_orders=4,
 ):
     return RuntimeConnectivityGuard(
         connectors={"hyperliquid_perpetual_testnet": connector},
@@ -88,6 +90,8 @@ def guard_for(
             reconnect_required_stable_seconds=reconnect_required_stable_seconds,
             reconciliation_max_retries=reconciliation_max_retries,
             reconciliation_retry_backoff_seconds=reconciliation_retry_backoff_seconds,
+            rate_limit_unsafe_threshold=rate_limit_unsafe_threshold,
+            max_open_orders=max_open_orders,
         ),
         store=ConnectivityStateStore(
             state_path=str(tmp_path / "state.json"),
@@ -261,7 +265,7 @@ def test_rate_limited_order_failure_does_not_make_orders_unknown(tmp_path):
             "public_ws_status": "connected",
             "private_ws_status": "connected",
             "rest_health": "healthy",
-            "order_failure_count": 1,
+            "order_failure_count": 2,
             "last_order_failure_type": "rate_limit",
             "last_order_failure_message": "HTTP 429 too many requests",
             "last_order_book_update_timestamp": 1000,
@@ -269,7 +273,7 @@ def test_rate_limited_order_failure_does_not_make_orders_unknown(tmp_path):
         },
         order_count=0,
     )
-    guard = guard_for(tmp_path, connector)
+    guard = guard_for(tmp_path, connector, rate_limit_unsafe_threshold=3)
 
     snapshot = guard.evaluate(1000)
 
@@ -278,6 +282,90 @@ def test_rate_limited_order_failure_does_not_make_orders_unknown(tmp_path):
     assert snapshot.reconciliation_result == "not_started"
     assert snapshot.quoting_enabled is True
     assert "order_path_rate_limited" in snapshot.reason
+    assert "order_path_rate_limited_persistent" not in snapshot.reason
+
+
+def test_persistent_rate_limited_order_failures_become_unsafe(tmp_path):
+    connector = FakeConnector(
+        runtime={
+            "public_ws_status": "connected",
+            "private_ws_status": "connected",
+            "rest_health": "healthy",
+            "order_failure_count": 3,
+            "last_order_failure_type": "rate_limit",
+            "last_order_failure_message": "HTTP 429 too many requests",
+            "last_order_book_update_timestamp": 1000,
+            "last_user_stream_update_timestamp": 1000,
+        },
+        order_count=0,
+    )
+    guard = guard_for(tmp_path, connector, rate_limit_unsafe_threshold=3)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.DEGRADED_UNSAFE
+    assert snapshot.orders_unknown is True
+    assert snapshot.quoting_enabled is False
+    assert "order_path_rate_limited_persistent" in snapshot.reason
+
+
+def test_open_order_count_over_cap_becomes_unsafe(tmp_path):
+    connector = FakeConnector(
+        runtime={
+            "public_ws_status": "connected",
+            "private_ws_status": "connected",
+            "rest_health": "healthy",
+            "last_order_book_update_timestamp": 1000,
+            "last_user_stream_update_timestamp": 1000,
+        },
+        order_count=5,
+    )
+    guard = guard_for(tmp_path, connector, max_open_orders=4)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.DEGRADED_UNSAFE
+    assert snapshot.orders_unknown is True
+    assert snapshot.quoting_enabled is False
+    assert "open_order_cap_exceeded" in snapshot.reason
+
+
+def test_reconciliation_success_clears_rate_limit_failure_streak(tmp_path):
+    connector = FakeConnector(
+        runtime={
+            "public_ws_status": "connected",
+            "private_ws_status": "connected",
+            "rest_health": "healthy",
+            "order_failure_count": 3,
+            "last_order_failure_type": "rate_limit",
+            "last_order_failure_message": "HTTP 429 too many requests",
+            "last_order_book_update_timestamp": 1000,
+            "last_user_stream_update_timestamp": 1000,
+        },
+        order_count=0,
+    )
+    guard = guard_for(tmp_path, connector, rate_limit_unsafe_threshold=3, reconnect_required_stable_seconds=0)
+    unsafe = guard.evaluate(1000)
+    assert unsafe.state == ConnectivityState.DEGRADED_UNSAFE
+    assert guard._rate_limit_failure_streak == 3
+
+    connector._hb_runtime_connectivity["order_failure_count"] = 0
+    connector._hb_runtime_connectivity.pop("last_order_failure_type", None)
+    connector._hb_runtime_connectivity.pop("last_order_failure_message", None)
+
+    async def run_reconciliation():
+        await guard._reconcile()
+
+    asyncio.run(run_reconciliation())
+
+    assert guard._rate_limit_failure_streak == 0
+    assert guard._last_seen_order_failure_count == 0
+    assert guard.reconciliation_result == "succeeded"
+
+    soaking = guard.evaluate(1001)
+    assert soaking.state == ConnectivityState.HEALTHY
+    assert soaking.orders_unknown is False
+    assert soaking.quoting_enabled is True
 
 
 def test_reconciliation_retries_after_transient_failure_with_backoff(tmp_path):

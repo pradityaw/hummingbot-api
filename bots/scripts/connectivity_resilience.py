@@ -27,6 +27,8 @@ class ConnectivityThresholds:
     cancel_retry_seconds: float = float(os.environ.get("HB_CONNECTIVITY_CANCEL_RETRY_SECONDS", "15"))
     reconciliation_max_retries: int = int(os.environ.get("HB_CONNECTIVITY_RECONCILIATION_MAX_RETRIES", "3"))
     reconciliation_retry_backoff_seconds: float = float(os.environ.get("HB_CONNECTIVITY_RECONCILIATION_RETRY_BACKOFF_SECONDS", "5"))
+    rate_limit_unsafe_threshold: int = int(os.environ.get("HB_CONNECTIVITY_RATE_LIMIT_UNSAFE_THRESHOLD", "3"))
+    max_open_orders: int = int(os.environ.get("HB_CONNECTIVITY_MAX_OPEN_ORDERS", "4"))
 
 
 @dataclass
@@ -186,6 +188,8 @@ class RuntimeConnectivityGuard:
         self._reconciliation_retry_count = 0
         self._next_reconciliation_attempt_at = 0.0
         self._reconciliation_retry_exhausted = False
+        self._rate_limit_failure_streak = 0
+        self._last_seen_order_failure_count = 0
 
     @property
     def quoting_enabled(self) -> bool:
@@ -264,13 +268,32 @@ class RuntimeConnectivityGuard:
             self._reconnect_soak_required = True
         if order_failures > 0:
             if _is_rate_limit_order_failure(order_failure_type, order_failure_message):
-                reason_parts.append("order_path_rate_limited")
-                if state == ConnectivityState.HEALTHY:
-                    state = ConnectivityState.DEGRADED_TRANSIENT
+                self._update_rate_limit_failure_streak(order_failures)
+                if self._rate_limit_failure_streak >= self.thresholds.rate_limit_unsafe_threshold:
+                    if state != ConnectivityState.HARD_DISCONNECTED:
+                        state = ConnectivityState.DEGRADED_UNSAFE
+                    reason_parts.append("order_path_rate_limited_persistent")
+                    self.orders_unknown = True
+                    self._reconnect_soak_required = True
+                else:
+                    reason_parts.append("order_path_rate_limited")
+                    if state == ConnectivityState.HEALTHY:
+                        state = ConnectivityState.DEGRADED_TRANSIENT
             else:
+                self._rate_limit_failure_streak = 0
                 reason_parts.append("order_path_failure")
                 self.orders_unknown = True
                 self._reconnect_soak_required = True
+        elif order_failures == 0:
+            self._rate_limit_failure_streak = 0
+            self._last_seen_order_failure_count = 0
+
+        if open_order_count > self.thresholds.max_open_orders:
+            if state != ConnectivityState.HARD_DISCONNECTED:
+                state = ConnectivityState.DEGRADED_UNSAFE
+            reason_parts.append("open_order_cap_exceeded")
+            self.orders_unknown = True
+            self._reconnect_soak_required = True
 
         telemetry_state = state
         transport_unsafe = telemetry_state in {ConnectivityState.DEGRADED_UNSAFE, ConnectivityState.HARD_DISCONNECTED}
@@ -429,6 +452,11 @@ class RuntimeConnectivityGuard:
         reason_parts.append("reconnect_stabilizing")
         return ConnectivityState.RECOVERING
 
+    def _update_rate_limit_failure_streak(self, order_failures: int) -> None:
+        if order_failures > self._last_seen_order_failure_count:
+            self._rate_limit_failure_streak += order_failures - self._last_seen_order_failure_count
+        self._last_seen_order_failure_count = order_failures
+
     def _reset_reconnect_stability(self) -> None:
         self._reconnect_stable_started_at = None
 
@@ -510,12 +538,15 @@ class RuntimeConnectivityGuard:
             return
         self.reconciliation_result = "succeeded"
         self.orders_unknown = False
+        self._rate_limit_failure_streak = 0
+        self._last_seen_order_failure_count = 0
         self._reset_reconciliation_retries()
         for connector in self.connectors.values():
             runtime = getattr(connector, "_hb_runtime_connectivity", None)
             if isinstance(runtime, dict):
                 runtime["cancel_failure_count"] = 0
                 runtime["order_failure_count"] = 0
+                runtime["rate_limit_failure_count"] = 0
                 runtime["open_order_count_during_disconnect"] = 0
         if self.snapshot:
             self.store.write_event("reconciliation_succeeded", self.snapshot)
