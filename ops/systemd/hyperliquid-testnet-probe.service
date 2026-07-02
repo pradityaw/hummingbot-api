@@ -4,6 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+EnvironmentFile=-/root/hyperliquid-condor-mm/.env
 Type=oneshot
 WorkingDirectory=/root/hummingbot-api
 ExecStart=/usr/bin/python3 /root/hummingbot-api/ops/probe_hyperliquid_testnet.py

@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 import aiohttp
 
 
-DEFAULT_BOT_NAME = "hl-testnet-pmm-20260628-185328"
+DEFAULT_BOT_NAME = "hl-testnet-pmm-20260702-085126"
 
 
 def utc_now() -> datetime:
