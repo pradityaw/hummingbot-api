@@ -185,6 +185,8 @@ ops/*.log
 ops/*.state
 ops/hyperliquid-probes/
 ops/watchdog-status/
+ops/*.nohup
+ops/*.err
 
 # IDE files
 .vscode/

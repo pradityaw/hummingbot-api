@@ -5,5 +5,5 @@ After=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/root/hummingbot-api
-Environment=BOT_NAME=hl-testnet-pmm-btc-vps-20260618-085408
+Environment=BOT_NAME=hl-testnet-pmm-20260628-185328
 ExecStart=/root/hummingbot-api/ops/watch_hyperliquid_pmm_remote.sh
