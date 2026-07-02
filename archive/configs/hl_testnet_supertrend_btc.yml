@@ -1,0 +1,13 @@
+id: hl_testnet_supertrend_btc
+controller_name: supertrend_v1
+controller_type: directional_trading
+connector_name: hyperliquid_perpetual_testnet
+trading_pair: BTC-USD
+candles_connector: hyperliquid_perpetual_testnet
+candles_trading_pair: BTC-USD
+interval: 3m
+length: 20
+multiplier: 4.0
+percentage_threshold: 0.01
+total_amount_quote: 25
+leverage: 1

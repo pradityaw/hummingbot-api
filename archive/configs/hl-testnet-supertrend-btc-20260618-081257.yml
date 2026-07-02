@@ -1,0 +1,3 @@
+controllers_config:
+- hl_testnet_supertrend_btc.yml
+script_file_name: v2_with_controllers.py
