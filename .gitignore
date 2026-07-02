@@ -187,6 +187,10 @@ ops/hyperliquid-probes/
 ops/watchdog-status/
 ops/*.nohup
 ops/*.err
+ops/resume-ready-notify.*
+
+# Pytest cache
+.pytest_cache/
 
 # IDE files
 .vscode/
