@@ -15,8 +15,8 @@ Continue the Hyperliquid testnet recovery hardening rollout so a **new** testnet
 ## Read first (in order)
 
 1. `CLOUD_AGENT_HANDOFF.md` (this file)
-2. `ops/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md`
-3. `CURSOR_HANDOFF.md`
+2. `archive/handoffs/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md`
+3. `archive/handoffs/CURSOR_HANDOFF.md`
 4. `/Users/dubski/Projects/hyperliquid-condor-mm/docs/HANDOFF.md` (umbrella ops; open if multi-root workspace available)
 
 ---
@@ -154,7 +154,7 @@ Pass when:
 ```text
 Continue Hyperliquid testnet recovery hardening rollout on branch cursor-hyperliquid-recovery-hardening.
 
-Read CLOUD_AGENT_HANDOFF.md first, then ops/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md.
+Read CLOUD_AGENT_HANDOFF.md first, then archive/handoffs/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md.
 
 Context:
 - Local hardening is done; 32 tests pass
