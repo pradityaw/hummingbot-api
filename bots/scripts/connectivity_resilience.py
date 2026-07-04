@@ -532,9 +532,21 @@ class RuntimeConnectivityGuard:
         if remaining_open_orders > 0:
             self.reconciliation_result = "failed"
             self.orders_unknown = True
-            self._reconciliation_retry_exhausted = True
+            self._reconciliation_retry_count += 1
+            retry_backoff = max(0.0, float(self.thresholds.reconciliation_retry_backoff_seconds))
+            retry_delay = retry_backoff * self._reconciliation_retry_count
+            self._next_reconciliation_attempt_at = self.time_fn() + retry_delay
             if self.snapshot:
-                self.store.write_event("reconciliation_failed", self.snapshot, {"remaining_open_order_count": remaining_open_orders})
+                self.store.write_event(
+                    "reconciliation_retry_scheduled",
+                    self.snapshot,
+                    {
+                        "remaining_open_order_count": remaining_open_orders,
+                        "reconciliation_retry_count": self._reconciliation_retry_count,
+                        "next_reconciliation_attempt_at": self._next_reconciliation_attempt_at,
+                        "reconciliation_retries_remaining": -1,
+                    },
+                )
             return
         self.reconciliation_result = "succeeded"
         self.orders_unknown = False
@@ -551,8 +563,18 @@ class RuntimeConnectivityGuard:
         if self.snapshot:
             self.store.write_event("reconciliation_succeeded", self.snapshot)
 
+    def _should_apply_safety_actions(self) -> bool:
+        if not self.snapshot:
+            return False
+        if self.snapshot.state in {ConnectivityState.DEGRADED_UNSAFE, ConnectivityState.HARD_DISCONNECTED}:
+            return True
+        if self.snapshot.state != ConnectivityState.RECOVERING:
+            return False
+        reconciliation_incomplete = self.reconciliation_result in {"required", "running", "failed"}
+        return reconciliation_incomplete or self.orders_unknown or self.snapshot.orders_unknown
+
     def apply_safety_actions(self, executors: Iterable[Any], executor_orchestrator: Any, stop_action_cls: Any) -> None:
-        if not self.snapshot or self.snapshot.state not in {ConnectivityState.DEGRADED_UNSAFE, ConnectivityState.HARD_DISCONNECTED}:
+        if not self._should_apply_safety_actions():
             return
         now = self.time_fn()
         actions = []

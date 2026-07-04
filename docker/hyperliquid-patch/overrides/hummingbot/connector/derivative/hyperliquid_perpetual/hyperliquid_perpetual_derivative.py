@@ -649,25 +649,34 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
                 path_url=CONSTANTS.CANCEL_ORDER_URL,
                 data=api_params,
                 is_auth_required=True)
-            response = cancel_result.get("response", {}) if isinstance(cancel_result, dict) else {}
-            data = response.get("data", {}) if isinstance(response, dict) else {}
-            statuses = data.get("statuses", []) if isinstance(data, dict) else []
-            status = statuses[0] if statuses else {}
-            exchange_status = cancel_result.get("status") if isinstance(cancel_result, dict) else None
-            if exchange_status == "err" or (isinstance(status, dict) and "error" in status):
-                self.logger().debug(f"The order {order_id} does not exist on Hyperliquid Perpetuals. "
-                                    f"No cancelation needed.")
-                await self._order_tracker.process_order_not_found(order_id)
-                error_message = status.get("error", response) if isinstance(status, dict) else response
-                raise IOError(str(error_message))
-            if self._is_successful_cancel_status(status):
-                return True
-            raise IOError(f"Unexpected cancel response for {order_id}: {cancel_result}")
         except Exception as exc:
             record_cancel_failure(self, type(exc).__name__, str(exc))
             raise
 
+        response = cancel_result.get("response", {}) if isinstance(cancel_result, dict) else {}
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        statuses = data.get("statuses", []) if isinstance(data, dict) else []
+        status = statuses[0] if statuses else {}
+        exchange_status = cancel_result.get("status") if isinstance(cancel_result, dict) else None
+        if exchange_status == "err" or (isinstance(status, dict) and "error" in status):
+            self.logger().debug(f"The order {order_id} does not exist on Hyperliquid Perpetuals. "
+                                f"No cancelation needed.")
+            await self._order_tracker.process_order_not_found(order_id)
+            error_message = status.get("error", response) if isinstance(status, dict) else response
+            raise IOError(str(error_message))
+        if self._is_successful_cancel_status(status):
+            return True
+        record_cancel_failure(self, "IOError", f"Unexpected cancel response for {order_id}: {cancel_result}")
+        raise IOError(f"Unexpected cancel response for {order_id}: {cancel_result}")
+
     # === Orders placing ===
+
+    def _runtime_quoting_enabled(self) -> bool:
+        return bool(getattr(self, "_hb_runtime_quoting_enabled", True))
+
+    def _ensure_runtime_quoting_enabled(self) -> None:
+        if not self._runtime_quoting_enabled():
+            raise IOError("Quoting disabled by runtime connectivity guard")
 
     def buy(self,
             trading_pair: str,
@@ -685,6 +694,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
         :return: the id assigned by the connector to the order (the client id)
         """
+        self._ensure_runtime_quoting_enabled()
         order_id = get_new_client_order_id(
             is_buy=True,
             trading_pair=trading_pair,
@@ -722,6 +732,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         :param price: the order price
         :return: the id assigned by the connector to the order (the client id)
         """
+        self._ensure_runtime_quoting_enabled()
         order_id = get_new_client_order_id(
             is_buy=False,
             trading_pair=trading_pair,
@@ -756,6 +767,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             position_action: PositionAction = PositionAction.NIL,
             **kwargs,
     ) -> Tuple[str, float]:
+        self._ensure_runtime_quoting_enabled()
 
         coin = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         param_order_type = {"limit": {"tif": "Gtc"}}

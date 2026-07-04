@@ -461,3 +461,88 @@ def test_cancel_path_unavailable_marks_orders_unknown(tmp_path):
     guard.apply_safety_actions([FakeExecutor()], FakeOrchestrator(), FakeStopAction)
 
     assert guard.orders_unknown is True
+
+
+def test_recovering_with_open_orders_triggers_safety_actions(tmp_path):
+    connector = FakeConnector(
+        runtime={
+            "public_ws_status": "connected",
+            "private_ws_status": "connected",
+            "rest_health": "healthy",
+            "cancel_failure_count": 1,
+            "last_order_book_update_timestamp": 1000,
+            "last_user_stream_update_timestamp": 1000,
+        },
+        order_count=2,
+    )
+    guard = guard_for(tmp_path, connector)
+    snapshot = guard.evaluate(1000)
+    orchestrator = FakeOrchestrator()
+
+    guard.apply_safety_actions([FakeExecutor()], orchestrator, FakeStopAction)
+
+    assert snapshot.state == ConnectivityState.RECOVERING
+    assert snapshot.quoting_enabled is False
+    assert len(orchestrator.actions) == 1
+    assert connector.cancel_calls == 1
+
+
+def test_reconciliation_retries_when_open_orders_remain(tmp_path):
+    current_time = {"now": 1000.0}
+    connector = FakeConnector(
+        runtime={
+            "public_ws_status": "connected",
+            "private_ws_status": "connected",
+            "rest_health": "healthy",
+            "last_order_book_update_timestamp": 1000,
+            "last_user_stream_update_timestamp": 1000,
+        },
+        order_count=2,
+    )
+    guard = RuntimeConnectivityGuard(
+        connectors={"hyperliquid_perpetual_testnet": connector},
+        thresholds=ConnectivityThresholds(
+            order_book_stale_seconds=45,
+            user_stream_stale_seconds=90,
+            hard_disconnect_seconds=20,
+            reconnect_required_stable_seconds=0,
+            reconciliation_max_retries=1,
+            reconciliation_retry_backoff_seconds=2,
+        ),
+        store=ConnectivityStateStore(
+            state_path=str(tmp_path / "state.json"),
+            event_log_path=str(tmp_path / "events.jsonl"),
+        ),
+        time_fn=lambda: current_time["now"],
+    )
+    guard._last_state = ConnectivityState.HARD_DISCONNECTED
+    guard.reconciliation_result = "required"
+    guard.orders_unknown = True
+
+    async def run_reconciliation_cycle():
+        first = guard.evaluate(current_time["now"])
+        assert first.state == ConnectivityState.RECOVERING
+        await asyncio.sleep(0)
+        assert guard.reconciliation_result == "failed"
+        assert guard._reconciliation_retry_exhausted is False
+
+        current_time["now"] = 1001.0
+        before_backoff = guard.evaluate(current_time["now"])
+        await asyncio.sleep(0)
+        assert before_backoff.reconciliation_result == "failed"
+        assert guard._reconciliation_retry_exhausted is False
+
+        current_time["now"] = 1003.0
+        connector._order_tracker.all_updatable_orders = {}
+        retrying = guard.evaluate(current_time["now"])
+        assert retrying.reconciliation_result == "running"
+        await asyncio.sleep(0)
+        recovered = guard.evaluate(current_time["now"])
+        assert recovered.reconciliation_result == "succeeded"
+        assert guard._reconciliation_retry_exhausted is False
+
+    asyncio.run(run_reconciliation_cycle())
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert "reconciliation_retry_scheduled" in [event["event_type"] for event in events]
+    assert "reconciliation_succeeded" in [event["event_type"] for event in events]

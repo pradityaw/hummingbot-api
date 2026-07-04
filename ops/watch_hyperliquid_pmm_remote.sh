@@ -16,6 +16,7 @@ BENIGN_DISCONNECT_THRESHOLD="${BENIGN_DISCONNECT_THRESHOLD:-12}"
 EXCHANGE_5XX_THRESHOLD="${EXCHANGE_5XX_THRESHOLD:-3}"
 OPEN_ORDER_FAILED_THRESHOLD="${OPEN_ORDER_FAILED_THRESHOLD:-10}"
 QUOTE_GAP_SECONDS="${QUOTE_GAP_SECONDS:-300}"
+STUCK_RECOVERING_SECONDS="${STUCK_RECOVERING_SECONDS:-1800}"
 STALLED_RUNTIME_SECONDS="${STALLED_RUNTIME_SECONDS:-180}"
 STARTUP_GRACE_SECONDS="${STARTUP_GRACE_SECONDS:-180}"
 HYPERLIQUID_INFO_URL="${HYPERLIQUID_INFO_URL:-https://api.hyperliquid-testnet.xyz/info}"
@@ -236,6 +237,7 @@ activation_file="$STATE_DIR/activation_epoch"
 last_status_file="$STATE_DIR/last_bot_status"
 last_bot_file="$STATE_DIR/last_bot_name"
 quote_gap_file="$STATE_DIR/quote_gap_started_epoch"
+stuck_recovering_file="$STATE_DIR/stuck_recovering_started_epoch"
 stop_state_file="$STATE_DIR/last_stop_state.json"
 
 previous_bot_status=""
@@ -254,7 +256,7 @@ fi
 if [ -z "$activation_epoch" ] || [ "$previous_bot_name" != "$bot_name" ] || { [ "$bot_status" = "running" ] && [ "$previous_bot_status" != "running" ]; }; then
   activation_epoch="$now_epoch"
   printf '%s\n' "$activation_epoch" > "$activation_file"
-  rm -f "$quote_gap_file" "$stop_state_file"
+  rm -f "$quote_gap_file" "$stuck_recovering_file" "$stop_state_file"
 fi
 printf '%s\n' "$bot_status" > "$last_status_file"
 printf '%s\n' "$bot_name" > "$last_bot_file"
@@ -401,6 +403,17 @@ else
   rm -f "$quote_gap_file"
 fi
 
+stuck_recovering_seconds=0
+if [ "$runtime_connectivity_ok" = true ] && [ "$runtime_state" = "RECOVERING" ]; then
+  if [ ! -f "$stuck_recovering_file" ]; then
+    printf '%s\n' "$now_epoch" > "$stuck_recovering_file"
+  fi
+  stuck_recovering_started="$(cat "$stuck_recovering_file")"
+  stuck_recovering_seconds=$((now_epoch - stuck_recovering_started))
+else
+  rm -f "$stuck_recovering_file"
+fi
+
 hard_reasons=()
 degraded_reasons=()
 within_startup_grace=false
@@ -415,6 +428,9 @@ if [ "$runtime_connectivity_ok" = true ]; then
       ;;
     RECOVERING)
       degraded_reasons+=("runtime_recovering:${runtime_watchdog_reason}")
+      if [ "$stuck_recovering_seconds" -ge "$STUCK_RECOVERING_SECONDS" ]; then
+        hard_reasons+=("stuck_recovering:${runtime_watchdog_reason}")
+      fi
       ;;
     DEGRADED_TRANSIENT)
       degraded_reasons+=("runtime_degraded_transient:${runtime_watchdog_reason}")
@@ -539,6 +555,7 @@ cat > "$tmp_status" <<EOF
   "latest_order_event_epoch": $latest_order_event_epoch,
   "latest_order_event_age_seconds": $latest_order_event_age_seconds,
   "quote_gap_seconds": $quote_gap_seconds,
+  "stuck_recovering_seconds": $stuck_recovering_seconds,
   "hyperliquid_info_http_code": "$hl_code",
   "runtime_connectivity_available": $runtime_connectivity_ok,
   "runtime_state": "$runtime_state",

@@ -231,7 +231,9 @@ def test_cancel_response_with_string_success_is_accepted():
     connector = connector_for(module)
     connector.coin_to_asset = {"BTC": 0}
     connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
-    connector._order_tracker = SimpleNamespace(process_order_not_found=lambda order_id: None)
+    connector._order_tracker = SimpleNamespace(
+        process_order_not_found=lambda order_id: asyncio.sleep(0),
+    )
 
     async def api_post(**kwargs):
         return {
@@ -249,6 +251,106 @@ def test_cancel_response_with_string_success_is_accepted():
 
     assert result is True
     assert connector._hb_runtime_connectivity.get("cancel_failure_count", 0) == 0
+
+
+def test_cancel_order_not_found_does_not_increment_cancel_failure_count():
+    module, _ = load_derivative_module()
+    connector = connector_for(module)
+    connector.coin_to_asset = {"BTC": 0}
+    connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
+    connector._order_tracker = SimpleNamespace(
+        process_order_not_found=lambda order_id: asyncio.sleep(0),
+    )
+
+    async def api_post(**kwargs):
+        return {
+            "status": "err",
+            "response": {
+                "type": "cancel",
+                "data": {"statuses": [{"error": "Order not found"}]},
+            },
+        }
+
+    connector._api_post = api_post
+    tracked_order = SimpleNamespace(trading_pair="BTC-USD")
+
+    try:
+        asyncio.run(module.HyperliquidPerpetualDerivative._place_cancel(connector, "client-order", tracked_order))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("Expected order-not-found cancel to raise")
+
+    assert connector._hb_runtime_connectivity.get("cancel_failure_count", 0) == 0
+
+
+def test_cancel_transport_failure_increments_cancel_failure_count():
+    module, runtime_module = load_derivative_module()
+    connector = connector_for(module)
+    connector.coin_to_asset = {"BTC": 0}
+    connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
+    connector._order_tracker = SimpleNamespace(
+        process_order_not_found=lambda order_id: asyncio.sleep(0),
+    )
+
+    async def api_post(**kwargs):
+        raise OSError("connection reset")
+
+    connector._api_post = api_post
+    tracked_order = SimpleNamespace(trading_pair="BTC-USD")
+
+    try:
+        asyncio.run(module.HyperliquidPerpetualDerivative._place_cancel(connector, "client-order", tracked_order))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("Expected transport failure to raise")
+
+    assert connector._hb_runtime_connectivity.get("cancel_failure_count", 0) == 1
+
+
+def test_buy_rejected_when_runtime_quoting_disabled():
+    module, _ = load_derivative_module()
+    connector = connector_for(module)
+    connector._hb_runtime_quoting_enabled = False
+
+    try:
+        module.HyperliquidPerpetualDerivative.buy(
+            connector,
+            trading_pair="BTC-USD",
+            amount=module.Decimal("0.0001"),
+            order_type=module.OrderType.LIMIT,
+            price=module.Decimal("50000"),
+        )
+    except (OSError, IOError) as exc:
+        assert "Quoting disabled" in str(exc)
+    else:
+        raise AssertionError("Expected buy to be rejected when quoting disabled")
+
+
+def test_place_order_rejected_when_runtime_quoting_disabled():
+    module, _ = load_derivative_module()
+    connector = connector_for(module)
+    connector._hb_runtime_quoting_enabled = False
+    connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
+    connector.coin_to_asset = {"BTC": 0}
+
+    try:
+        asyncio.run(
+            module.HyperliquidPerpetualDerivative._place_order(
+                connector,
+                order_id="0xabc",
+                trading_pair="BTC-USD",
+                amount=module.Decimal("0.0001"),
+                trade_type=module.TradeType.BUY,
+                order_type=module.OrderType.LIMIT,
+                price=module.Decimal("50000"),
+            )
+        )
+    except OSError as exc:
+        assert "Quoting disabled" in str(exc)
+    else:
+        raise AssertionError("Expected _place_order to be rejected when quoting disabled")
 
 
 def test_api_post_retries_transient_read_request_and_records_attempts(monkeypatch):

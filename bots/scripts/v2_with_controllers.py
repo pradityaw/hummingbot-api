@@ -46,6 +46,9 @@ class V2WithControllers(StrategyV2Base):
 
     def on_tick(self):
         connectivity_snapshot = self.connectivity_guard.evaluate(self.current_timestamp)
+        if not self._is_stop_triggered:
+            self.check_manual_kill_switch()
+            self.control_max_drawdown()
         if not connectivity_snapshot.quoting_enabled:
             self.connectivity_guard.apply_safety_actions(
                 executors=self.get_all_executors(),
@@ -56,8 +59,6 @@ class V2WithControllers(StrategyV2Base):
             return
         super().on_tick()
         if not self._is_stop_triggered:
-            self.check_manual_kill_switch()
-            self.control_max_drawdown()
             self.send_performance_report()
 
     def control_max_drawdown(self):
