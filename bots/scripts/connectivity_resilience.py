@@ -29,6 +29,8 @@ class ConnectivityThresholds:
     reconciliation_retry_backoff_seconds: float = float(os.environ.get("HB_CONNECTIVITY_RECONCILIATION_RETRY_BACKOFF_SECONDS", "5"))
     rate_limit_unsafe_threshold: int = int(os.environ.get("HB_CONNECTIVITY_RATE_LIMIT_UNSAFE_THRESHOLD", "3"))
     max_open_orders: int = int(os.environ.get("HB_CONNECTIVITY_MAX_OPEN_ORDERS", "4"))
+    # Disabled when unset, empty, or <= 0 — avoids halting testnet quoting until explicitly armed.
+    max_book_spread_ratio: float = float(os.environ.get("HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO", "0") or "0")
 
 
 @dataclass
@@ -162,6 +164,104 @@ async def _maybe_await(result: Any) -> Any:
     return result
 
 
+def _extract_first_price(levels: Any) -> Optional[float]:
+    if levels is None:
+        return None
+    try:
+        level_count = len(levels)
+    except Exception:
+        return None
+    if level_count <= 0:
+        return None
+    try:
+        first = levels.iloc[0] if hasattr(levels, "iloc") else levels[0]
+    except Exception:
+        return None
+    if isinstance(first, dict):
+        price = first.get("price")
+    else:
+        price = getattr(first, "price", first)
+    try:
+        return float(price)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_book_for_pair(connector: Any, trading_pair: str) -> Any:
+    tracker = getattr(connector, "order_book_tracker", None)
+    if tracker is None:
+        return None
+    if hasattr(tracker, "ready") and not tracker.ready:
+        return None
+    order_books = getattr(tracker, "order_books", None)
+    if not order_books:
+        return None
+    if hasattr(order_books, "get"):
+        order_book = order_books.get(trading_pair)
+        if order_book is not None:
+            return order_book
+    try:
+        return next(iter(order_books.values()))
+    except StopIteration:
+        return None
+
+
+def _best_bid_ask_from_order_book(order_book: Any) -> Optional[tuple[float, float]]:
+    snapshot = getattr(order_book, "snapshot", None)
+    if snapshot is None:
+        return None
+    try:
+        bids, asks = snapshot
+    except Exception:
+        return None
+    best_bid = _extract_first_price(bids)
+    best_ask = _extract_first_price(asks)
+    if best_bid is None or best_ask is None:
+        return None
+    return best_bid, best_ask
+
+
+def _best_bid_ask_from_connector(connector: Any, trading_pair: str) -> Optional[tuple[float, float]]:
+    order_book = _order_book_for_pair(connector, trading_pair)
+    if order_book is not None:
+        prices = _best_bid_ask_from_order_book(order_book)
+        if prices is not None:
+            return prices
+    get_price = getattr(connector, "get_price", None)
+    if get_price is None:
+        return None
+    try:
+        best_bid = float(get_price(trading_pair, False))
+        best_ask = float(get_price(trading_pair, True))
+    except Exception:
+        return None
+    return best_bid, best_ask
+
+
+def _check_order_book_spread_sanity(
+    connector: Any,
+    trading_pair: str,
+    max_spread_ratio: float,
+) -> Optional[str]:
+    if max_spread_ratio <= 0:
+        return None
+    if connector is None:
+        return None
+    prices = _best_bid_ask_from_connector(connector, trading_pair)
+    if prices is None:
+        return None
+    best_bid, best_ask = prices
+    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        return "spread_sanity_failed"
+    mid_price = (best_bid + best_ask) / 2.0
+    if mid_price <= 0:
+        return "spread_sanity_failed"
+    spread_ratio = (best_ask - best_bid) / mid_price
+    if spread_ratio > max_spread_ratio:
+        return "order_book_spread_too_wide"
+    return None
+
+
 class RuntimeConnectivityGuard:
     def __init__(
         self,
@@ -250,6 +350,15 @@ class RuntimeConnectivityGuard:
             if state != ConnectivityState.HARD_DISCONNECTED:
                 state = ConnectivityState.DEGRADED_UNSAFE
             reason_parts.append("order_book_stale")
+        spread_sanity_reason = _check_order_book_spread_sanity(
+            connector,
+            trading_pair,
+            self.thresholds.max_book_spread_ratio,
+        )
+        if spread_sanity_reason:
+            if state != ConnectivityState.HARD_DISCONNECTED:
+                state = ConnectivityState.DEGRADED_UNSAFE
+            reason_parts.append(spread_sanity_reason)
         if last_user_stream_update and now - float(last_user_stream_update) > self.thresholds.user_stream_stale_seconds:
             if state != ConnectivityState.HARD_DISCONNECTED:
                 state = ConnectivityState.DEGRADED_UNSAFE
@@ -305,6 +414,7 @@ class RuntimeConnectivityGuard:
             last_order_book_update,
             last_user_stream_update,
             now,
+            spread_sanity_reason is None,
         )
 
         previously_unsafe = self._last_state in {ConnectivityState.DEGRADED_UNSAFE, ConnectivityState.HARD_DISCONNECTED}
@@ -413,12 +523,15 @@ class RuntimeConnectivityGuard:
         last_order_book_update: Optional[float],
         last_user_stream_update: Optional[float],
         now: float,
+        spread_sanity_ok: bool = True,
     ) -> bool:
         if telemetry_state != ConnectivityState.HEALTHY:
             return False
         if public_status in {"closed", "error", "connecting_failed"} or private_status in {"closed", "error", "connecting_failed"}:
             return False
         if rest_health not in {"unknown", "healthy", "ok"}:
+            return False
+        if not spread_sanity_ok:
             return False
         if last_order_book_update and now - float(last_order_book_update) > self.thresholds.order_book_stale_seconds:
             return False

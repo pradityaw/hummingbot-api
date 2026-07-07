@@ -20,16 +20,48 @@ class FakeConnector:
     network_status = "CONNECTED"
     _trading_pairs = ["BTC-USD"]
 
-    def __init__(self, runtime=None, order_count=0, cancel_available=True):
+    def __init__(self, runtime=None, order_count=0, cancel_available=True, order_book=None):
         self._hb_runtime_connectivity = runtime or {}
         self._order_tracker = FakeTracker(order_count)
         self.cancel_calls = 0
+        self.order_book_tracker = order_book
         if cancel_available:
             self.cancel_all = self._cancel_all
 
     def _cancel_all(self, timeout_seconds=10):
         self.cancel_calls += 1
         self._order_tracker.all_updatable_orders = {}
+
+
+class _FakeIloc:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __getitem__(self, idx):
+        return self._rows[idx]
+
+
+class FakeOrderBookLevels:
+    def __init__(self, price):
+        self._rows = [{"price": price}] if price is not None else []
+
+    def __len__(self):
+        return len(self._rows)
+
+    @property
+    def iloc(self):
+        return _FakeIloc(self._rows)
+
+
+class FakeOrderBook:
+    def __init__(self, best_bid, best_ask):
+        self.snapshot = (FakeOrderBookLevels(best_bid), FakeOrderBookLevels(best_ask))
+
+
+class FakeOrderBookTracker:
+    def __init__(self, trading_pair, best_bid, best_ask, ready=True):
+        self.ready = ready
+        self.order_books = {trading_pair: FakeOrderBook(best_bid, best_ask)}
 
 
 class FlakyReconcileConnector(FakeConnector):
@@ -80,6 +112,7 @@ def guard_for(
     reconciliation_retry_backoff_seconds=5,
     rate_limit_unsafe_threshold=3,
     max_open_orders=4,
+    max_book_spread_ratio=0.0,
 ):
     return RuntimeConnectivityGuard(
         connectors={"hyperliquid_perpetual_testnet": connector},
@@ -92,6 +125,7 @@ def guard_for(
             reconciliation_retry_backoff_seconds=reconciliation_retry_backoff_seconds,
             rate_limit_unsafe_threshold=rate_limit_unsafe_threshold,
             max_open_orders=max_open_orders,
+            max_book_spread_ratio=max_book_spread_ratio,
         ),
         store=ConnectivityStateStore(
             state_path=str(tmp_path / "state.json"),
@@ -431,6 +465,82 @@ def test_reconciliation_retries_after_transient_failure_with_backoff(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert "reconciliation_retry_scheduled" in [event["event_type"] for event in events]
     assert "reconciliation_succeeded" in [event["event_type"] for event in events]
+
+
+def _healthy_runtime():
+    return {
+        "public_ws_status": "connected",
+        "private_ws_status": "connected",
+        "rest_health": "healthy",
+        "last_order_book_update_timestamp": 1000,
+        "last_user_stream_update_timestamp": 1000,
+    }
+
+
+def test_spread_sanity_disabled_by_default_allows_quoting(tmp_path):
+    connector = FakeConnector(
+        runtime=_healthy_runtime(),
+        order_book=FakeOrderBookTracker("BTC-USD", best_bid=100.0, best_ask=200.0),
+    )
+    guard = guard_for(tmp_path, connector)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.HEALTHY
+    assert snapshot.quoting_enabled is True
+
+
+def test_wide_spread_disables_quoting_when_threshold_set(tmp_path):
+    connector = FakeConnector(
+        runtime=_healthy_runtime(),
+        order_book=FakeOrderBookTracker("BTC-USD", best_bid=100.0, best_ask=102.0),
+    )
+    guard = guard_for(tmp_path, connector, max_book_spread_ratio=0.01)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.DEGRADED_UNSAFE
+    assert snapshot.quoting_enabled is False
+    assert snapshot.readiness_reason == "order_book_spread_too_wide"
+    assert snapshot.watchdog_reason == "order_book_spread_too_wide"
+    assert "order_book_spread_too_wide" in snapshot.reason
+
+
+def test_tight_spread_passes_when_threshold_set(tmp_path):
+    connector = FakeConnector(
+        runtime=_healthy_runtime(),
+        order_book=FakeOrderBookTracker("BTC-USD", best_bid=100.0, best_ask=100.01),
+    )
+    guard = guard_for(tmp_path, connector, max_book_spread_ratio=0.01)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.HEALTHY
+    assert snapshot.quoting_enabled is True
+
+
+def test_crossed_book_fails_spread_sanity(tmp_path):
+    connector = FakeConnector(
+        runtime=_healthy_runtime(),
+        order_book=FakeOrderBookTracker("BTC-USD", best_bid=101.0, best_ask=100.0),
+    )
+    guard = guard_for(tmp_path, connector, max_book_spread_ratio=0.01)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.DEGRADED_UNSAFE
+    assert snapshot.quoting_enabled is False
+    assert "spread_sanity_failed" in snapshot.reason
+
+
+def test_missing_order_book_skips_spread_check(tmp_path):
+    connector = FakeConnector(runtime=_healthy_runtime(), order_book=None)
+    guard = guard_for(tmp_path, connector, max_book_spread_ratio=0.01)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.HEALTHY
+    assert snapshot.quoting_enabled is True
 
 
 def test_disconnect_while_quotes_exist_stops_executors_and_cancels(tmp_path):
