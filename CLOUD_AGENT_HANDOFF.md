@@ -1,8 +1,8 @@
 # Cloud Agent Handoff — Hyperliquid Recovery Hardening
 
-Date: 2026-07-04
+Date: 2026-07-07
 Branch: `cursor-hyperliquid-recovery-hardening`
-Status: **VPS rollout complete; post-deadlock soak passed; local fixes #3/#6 pending commit/deploy**
+Status: **Fixes #3/#6 committed + live. New bot `hl-testnet-pmm-20260707-113533-20260707-113533` HEALTHY, RESUME_READY, spread guard armed (0.01)**
 
 ---
 
@@ -40,9 +40,11 @@ Maintain a trustworthy Hyperliquid testnet PMM bot with hardened recovery, readi
 - Probe, watchdog, readiness, dry-run reconnect tooling
 - Readiness fail-closed on stale `bot_name` mismatch
 - Deadlock fixes (commit `5a4f11d`): order-not-found cancel handling, RECOVERING flatten, reconciliation retry, connector quote gate, drawdown/kill-switch when quoting disabled, stuck-RECOVERING watchdog escalation
-- **VPS rollout:** images rebuilt; bot `hl-testnet-pmm-20260704-053658-20260704-053658` deployed and soak-verified
-- **Fix #3 (local, uncommitted):** `HB_ALLOW_MAINNET=1` guardrail — `bots/scripts/v2_with_controllers.py`, `routers/bot_orchestration.py`, `bots/scripts/mainnet_guard.py`, `utils/mainnet_guard.py`, `test/test_mainnet_guard.py`
-- **Fix #6 (local, uncommitted):** order-book spread sanity check — `bots/scripts/connectivity_resilience.py`, `HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO` (default 0)
+- **Fix #3 (committed `b5f3e65`):** `HB_ALLOW_MAINNET=1` guardrail — `bots/scripts/v2_with_controllers.py`, `routers/bot_orchestration.py`, `bots/scripts/mainnet_guard.py`, `utils/mainnet_guard.py`, `test/test_mainnet_guard.py`
+- **Fix #6 (committed `24f1faf`):** order-book spread sanity check — `bots/scripts/connectivity_resilience.py`, `HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO` (default 0; **armed at 0.01 on VPS**)
+- **Env forwarding (committed `f7491f5`):** `HB_CONNECTIVITY_*`/`HB_ALLOW_MAINNET` env vars now propagate from the API to newly deployed bot containers (`services/docker_service.py`)
+- **Ops watcher fix (committed `f5d7cd9`):** resume-ready notifier no longer false-positives on `RESUME_NOT_READY` (anchored grep)
+- **VPS rollout 2026-07-07:** images rebuilt from `f7491f5` (bot 51a3b586826c, API ffba6c990688); runtime scripts synced; bot `hl-testnet-pmm-20260707-113533-20260707-113533` deployed (testnet_fresh, drawdown $10/$5) and validated `RESUME_READY`
 - **Tests:** 54 passed, 4 skipped (focused suite)
 
 ```bash
@@ -60,37 +62,38 @@ python3 -m pytest test/test_mainnet_guard.py \
 
 ## What is NOT done
 
-- Local fixes #3/#6 **not committed** and **not on VPS** (live bot still on pre-fix images)
-- **Condor/Telegram** not deployed — no `TELEGRAM_BOT_TOKEN` available
-- Soak summary parser bug (raw samples healthy; summary generation failed locally)
+- **Condor/Telegram** not deployed — no `TELEGRAM_BOT_TOKEN` available. Now the top gap: watchdog stops are silent and recovery is manual (bot was down Jul 5→Jul 7 unnoticed).
+- **Auto-recovery policy** — watchdog stops the bot on testnet outages but nothing restarts it once `RESUME_READY` holds; decide whether to add a gated auto-`docker restart`.
+- 24h soak of the new bot with the spread guard armed (watch for `order_book_spread_too_wide` false positives)
 
 ---
 
-## Live VPS state (last audit: 2026-07-04T14:09:30Z)
+## Live VPS state (last audit: 2026-07-07T12:12Z)
 
 SSH: `ssh -i ~/.ssh/id_ed25519 root@168.144.111.10`
 
 | Signal | Value |
 |--------|-------|
-| Bot | `hl-testnet-pmm-20260704-053658-20260704-053658` |
-| Controller | `hl_testnet_pmm_btc_wide` |
-| Image | `hummingbot/hummingbot:hyperliquid-fix` (a4604d08ac63) |
+| Bot | `hl-testnet-pmm-20260707-113533-20260707-113533` |
+| Controller | `hl_testnet_pmm_btc_wide` (90s refresh / 30s cooldown) |
+| Image | `hummingbot/hummingbot:hyperliquid-fix` (51a3b586826c, includes fixes #3/#6) |
+| Spread guard | `HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO=0.01` (armed, in bot container env) |
 | `current_state` | `HEALTHY` |
 | `quoting_enabled` | `true` |
 | `active_order_count` | `2` |
-| `resume_ready` | `true` |
+| `resume_ready` | `true` (15/15 probes) |
 | `orders_unknown` | `false` |
 | Watchdog | `action=none`, `bot_name_match=true` |
 | 5xx storm | none |
 
-**Soak (7 samples, 12:38–14:09 UTC):** all raw samples `HEALTHY`; no degradation observed.
+**History:** prior bot `…20260704-053658…` was watchdog-stopped Jul 5 06:50 and Jul 7 06:51 UTC during Hyperliquid testnet CloudFront 504/500 outages (guard worked as designed); it is docker-stopped with `--restart=no`. Wallet audit at the time: 0 open orders, 0 positions, ~$999.91 USDC (lifetime PnL ≈ -$0.09 over 90 fills).
 
 Quick audit:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'cd /root/hyperliquid-condor-mm && make status'
-ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 '/root/hummingbot-api/ops/check_hyperliquid_resume_ready.sh'
-ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'curl -sS -u admin:admin http://127.0.0.1:8000/bot-orchestration/hl-testnet-pmm-20260704-053658-20260704-053658/connectivity'
+ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'BOT_NAME=hl-testnet-pmm-20260707-113533-20260707-113533 /root/hummingbot-api/ops/check_hyperliquid_resume_ready.sh'
+ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'curl -sS -u admin:admin http://127.0.0.1:8000/bot-orchestration/hl-testnet-pmm-20260707-113533-20260707-113533/connectivity'
 ```
 
 ---
