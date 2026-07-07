@@ -28,7 +28,8 @@ while true; do
 
   echo "$(timestamp) poll_result $(printf '%q' "$output")" >> "$LOG_FILE"
 
-  if printf '%s\n' "$output" | grep -q 'RESUME_READY'; then
+  # Anchored match: plain 'RESUME_READY' also matches the RESUME_NOT_READY line.
+  if printf '%s\n' "$output" | grep -qx 'RESUME_READY'; then
     printf '%s\n' "$(timestamp) ready" > "$STATE_FILE"
     notify_ready "Passive probes and watchdog are clean. Safe to start the canary."
     echo "$(timestamp) watcher_finished ready" >> "$LOG_FILE"
