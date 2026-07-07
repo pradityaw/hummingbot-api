@@ -166,6 +166,19 @@ class DockerService:
         raw = os.environ.get("HBOT_BOT_DNS_SERVERS", "1.1.1.1,8.8.8.8")
         return [server.strip() for server in raw.split(",") if server.strip()]
 
+    @staticmethod
+    def _connectivity_guard_environment() -> Dict[str, str]:
+        """Forward HB_CONNECTIVITY_* / HB_ALLOW_MAINNET env vars from the API to new bot containers."""
+        forwarded = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("HB_CONNECTIVITY_") and value != ""
+        }
+        allow_mainnet = os.environ.get("HB_ALLOW_MAINNET")
+        if allow_mainnet:
+            forwarded["HB_ALLOW_MAINNET"] = allow_mainnet
+        return forwarded
+
     def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
@@ -259,7 +272,7 @@ class DockerService:
         }
 
         # Set up environment variables
-        environment = {}
+        environment = self._connectivity_guard_environment()
         password = settings.security.config_password
         if password:
             environment["CONFIG_PASSWORD"] = password

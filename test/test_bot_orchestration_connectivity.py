@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -71,3 +72,28 @@ def test_bot_container_dns_servers_can_be_disabled(monkeypatch):
     monkeypatch.setenv("HBOT_BOT_DNS_SERVERS", "")
 
     assert docker_service.DockerService._bot_container_dns_servers() == []
+
+
+def test_connectivity_guard_environment_forwards_hb_connectivity_vars(monkeypatch):
+    monkeypatch.setenv("HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO", "0.01")
+    monkeypatch.setenv("HB_CONNECTIVITY_MAX_OPEN_ORDERS", "4")
+    monkeypatch.setenv("HB_CONNECTIVITY_EMPTY", "")
+    monkeypatch.delenv("HB_ALLOW_MAINNET", raising=False)
+
+    env = docker_service.DockerService._connectivity_guard_environment()
+
+    assert env["HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO"] == "0.01"
+    assert env["HB_CONNECTIVITY_MAX_OPEN_ORDERS"] == "4"
+    assert "HB_CONNECTIVITY_EMPTY" not in env
+    assert "HB_ALLOW_MAINNET" not in env
+
+
+def test_connectivity_guard_environment_forwards_allow_mainnet_only_when_set(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("HB_CONNECTIVITY_"):
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HB_ALLOW_MAINNET", "1")
+
+    env = docker_service.DockerService._connectivity_guard_environment()
+
+    assert env == {"HB_ALLOW_MAINNET": "1"}
