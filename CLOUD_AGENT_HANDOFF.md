@@ -1,23 +1,23 @@
 # Cloud Agent Handoff — Hyperliquid Recovery Hardening
 
-Date: 2026-06-30  
-Branch: `cursor-hyperliquid-recovery-hardening`  
-Status: **Local hardening complete; VPS rollout not started**
+Date: 2026-07-04
+Branch: `cursor-hyperliquid-recovery-hardening`
+Status: **VPS rollout complete; post-deadlock soak passed; local fixes #3/#6 pending commit/deploy**
 
 ---
 
 ## Mission
 
-Continue the Hyperliquid testnet recovery hardening rollout so a **new** testnet bot is live-test ready with trustworthy readiness gates, patched connector/runtime behavior, and no false-green resume signals.
+Maintain a trustworthy Hyperliquid testnet PMM bot with hardened recovery, readiness gates, and pre-mainnet guardrails. Live bot is soak-verified; next work is commit/rollout of remaining local fixes and Condor alerting.
 
 ---
 
 ## Read first (in order)
 
 1. `CLOUD_AGENT_HANDOFF.md` (this file)
-2. `archive/handoffs/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md`
-3. `archive/handoffs/CURSOR_HANDOFF.md`
-4. `/Users/dubski/Projects/hyperliquid-condor-mm/docs/HANDOFF.md` (umbrella ops; open if multi-root workspace available)
+2. `/Users/dubski/Projects/hyperliquid-condor-mm/docs/PROJECT_STATUS.md` (day-to-day status)
+3. `archive/handoffs/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md`
+4. `/Users/dubski/Projects/hyperliquid-condor-mm/docs/HANDOFF.md` (umbrella ops)
 
 ---
 
@@ -32,59 +32,65 @@ Continue the Hyperliquid testnet recovery hardening rollout so a **new** testnet
 
 ---
 
-## What is already done (local)
+## What is already done
 
 - Connector defensive fixes (cancel parse, safe REST retry, WS telemetry)
 - Runtime connectivity guard + quote gating (`connectivity_resilience.py`)
 - API `/connectivity` endpoints
 - Probe, watchdog, readiness, dry-run reconnect tooling
-- Readiness fail-closed on stale `bot_name` mismatch (local scripts)
-- **Tests:** `32 passed` (run before deploy)
+- Readiness fail-closed on stale `bot_name` mismatch
+- Deadlock fixes (commit `5a4f11d`): order-not-found cancel handling, RECOVERING flatten, reconciliation retry, connector quote gate, drawdown/kill-switch when quoting disabled, stuck-RECOVERING watchdog escalation
+- **VPS rollout:** images rebuilt; bot `hl-testnet-pmm-20260704-053658-20260704-053658` deployed and soak-verified
+- **Fix #3 (local, uncommitted):** `HB_ALLOW_MAINNET=1` guardrail — `bots/scripts/v2_with_controllers.py`, `routers/bot_orchestration.py`, `bots/scripts/mainnet_guard.py`, `utils/mainnet_guard.py`, `test/test_mainnet_guard.py`
+- **Fix #6 (local, uncommitted):** order-book spread sanity check — `bots/scripts/connectivity_resilience.py`, `HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO` (default 0)
+- **Tests:** 54 passed, 4 skipped (focused suite)
 
 ```bash
 cd /Users/dubski/hummingbot-api
-python3 -m pytest test/test_hyperliquid_patch_installer.py \
-  test/test_hyperliquid_connector_defensive_fixes.py \
+python3 -m pytest test/test_mainnet_guard.py \
   test/test_hyperliquid_connectivity_resilience.py \
+  test/test_hyperliquid_patch_installer.py \
+  test/test_hyperliquid_connector_defensive_fixes.py \
   test/test_hyperliquid_probe_readiness.py \
-  test/test_hyperliquid_reconnect_tool.py -q
+  test/test_hyperliquid_reconnect_tool.py \
+  test/test_bot_orchestration_connectivity.py -q
 ```
 
 ---
 
 ## What is NOT done
 
-- No VPS deploy of updated ops scripts
-- No image rebuild/push to VPS
-- No new bot instance deployed
-- Old bot still running on pre-fix VPS scripts
+- Local fixes #3/#6 **not committed** and **not on VPS** (live bot still on pre-fix images)
+- **Condor/Telegram** not deployed — no `TELEGRAM_BOT_TOKEN` available
+- Soak summary parser bug (raw samples healthy; summary generation failed locally)
 
 ---
 
-## Live VPS state (last audit: 2026-06-29T21:34Z)
+## Live VPS state (last audit: 2026-07-04T14:09:30Z)
 
 SSH: `ssh -i ~/.ssh/id_ed25519 root@168.144.111.10`
 
 | Signal | Value |
 |--------|-------|
-| Bot | `hl-testnet-pmm-20260628-185328` |
+| Bot | `hl-testnet-pmm-20260704-053658-20260704-053658` |
 | Controller | `hl_testnet_pmm_btc_wide` |
-| Image | `hummingbot/hummingbot:hyperliquid-fix` (old build) |
-| `current_state` | `RECOVERING` |
-| `quoting_enabled` | `false` |
-| `reconciliation_result` | `running` |
-| `orders_unknown` | `true` |
-| Active orders | ~23 |
-| Reason | `order_path_failure,reconciliation_required` |
+| Image | `hummingbot/hummingbot:hyperliquid-fix` (a4604d08ac63) |
+| `current_state` | `HEALTHY` |
+| `quoting_enabled` | `true` |
+| `active_order_count` | `2` |
+| `resume_ready` | `true` |
+| `orders_unknown` | `false` |
+| Watchdog | `action=none`, `bot_name_match=true` |
+| 5xx storm | none |
 
-**Readiness gate bug (still on VPS):** `check_hyperliquid_resume_ready.sh` prints `RESUME_READY` while watchdog `bot_name` is stale (`hl-testnet-pmm-btc-vps-20260618-085408`). **Do not trust RESUME_READY until ops scripts are rsync'd.**
+**Soak (7 samples, 12:38–14:09 UTC):** all raw samples `HEALTHY`; no degradation observed.
 
 Quick audit:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'cd /root/hyperliquid-condor-mm && make status'
 ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 '/root/hummingbot-api/ops/check_hyperliquid_resume_ready.sh'
-ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'curl -sS -u admin:admin http://127.0.0.1:8000/bot-orchestration/hl-testnet-pmm-20260628-185328/connectivity'
+ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'curl -sS -u admin:admin http://127.0.0.1:8000/bot-orchestration/hl-testnet-pmm-20260704-053658-20260704-053658/connectivity'
 ```
 
 ---
@@ -99,15 +105,12 @@ ssh -i ~/.ssh/id_ed25519 root@168.144.111.10 'curl -sS -u admin:admin http://127
 
 ---
 
-## Gated rollout (execute in order)
+## Next rollout (when user confirms)
 
-### Gate 0 — Confirm VPS audit
-Read-only: `make status`, readiness, `/connectivity`, watchdog/probe bot_name match.
+### Step 1 — Commit local fixes
+Review and commit fixes #3 and #6 in `hummingbot-api`.
 
-### Gate 1 — Commit (if not already on branch)
-Both repos should be on `cursor-hyperliquid-recovery-hardening`.
-
-### Gate 2 — Rebuild images (ask user first)
+### Step 2 — Rebuild images (ask user first)
 ```bash
 cd /Users/dubski/hummingbot-api
 # Rebuild from docker/hyperliquid-patch/Dockerfile.bot and Dockerfile.api
@@ -115,51 +118,33 @@ cd /Users/dubski/hummingbot-api
 #       hummingbot/hummingbot-api:hyperliquid-fix
 ```
 
-### Gate 3 — Rsync ops scripts (ask user first)
-```bash
-rsync -av /Users/dubski/hummingbot-api/ops/ root@168.144.111.10:/root/hummingbot-api/ops/
-rsync -av /Users/dubski/Projects/hyperliquid-condor-mm/ops/ root@168.144.111.10:/root/hyperliquid-condor-mm/ops/
-ssh root@168.144.111.10 'systemctl restart hummingbot-hl-watchdog.timer hyperliquid-testnet-probe.timer'
-```
+### Step 3 — Ship images + deploy NEW bot (ask user first)
+Fresh instance from `configs/controllers/hl_testnet_pmm_btc_wide.yml`. Optionally set `HB_CONNECTIVITY_MAX_BOOK_SPREAD_RATIO` on rollout.
 
-Validate readiness now **fails closed** on stale bot_name until watchdog catches up.
+### Step 4 — Deploy Condor (ask user first)
+`make deploy-condor` with `TELEGRAM_BOT_TOKEN` in condor `.env`.
 
-### Gate 4 — Ship images to VPS (ask user first)
-Load/push rebuilt images; verify container image IDs before bot deploy.
-
-### Gate 5 — Stop old bot (ask user first)
-`hl-testnet-pmm-20260628-185328` — stop only with confirmation.
-
-### Gate 6 — Deploy NEW bot (ask user first)
-Fresh instance from `configs/controllers/hl_testnet_pmm_btc_wide.yml` (sync via condor-mm `make sync-configs` on VPS).
-
-### Gate 7 — Validate live-test readiness
+### Step 5 — Validate
 ```bash
 cd /root/hyperliquid-condor-mm && make status
 BOT_NAME=<new-bot> /root/hummingbot-api/ops/check_hyperliquid_resume_ready.sh
 curl -u admin:admin http://127.0.0.1:8000/bot-orchestration/<new-bot>/connectivity
-curl -u admin:admin http://127.0.0.1:8000/bot-orchestration/<new-bot>/health
 ```
-
-Pass when:
-- watchdog/probe `bot_name` matches new bot
-- readiness is trustworthy (no mismatch warnings)
-- `quoting_enabled=true` only after reconciliation succeeds + soak gate
-- no persistent `orders_unknown` or cancel-parse / rate-limit loops
 
 ---
 
 ## Cloud agent prompt (paste into Cursor Cloud)
 
 ```text
-Continue Hyperliquid testnet recovery hardening rollout on branch cursor-hyperliquid-recovery-hardening.
+Continue Hyperliquid testnet PMM ops on branch cursor-hyperliquid-recovery-hardening.
 
-Read CLOUD_AGENT_HANDOFF.md first, then archive/handoffs/HYPERLIQUID_RECOVERY_HARDENING_HANDOFF_20260629.md.
+Read CLOUD_AGENT_HANDOFF.md and hyperliquid-condor-mm/docs/PROJECT_STATUS.md first.
 
 Context:
-- Local hardening is done; 32 tests pass
-- VPS still on old image/scripts; live bot hl-testnet-pmm-20260628-185328 stuck RECOVERING
-- Readiness gate falsely RESUME_READY due to stale watchdog bot_name
+- Live bot hl-testnet-pmm-20260704-053658-20260704-053658 HEALTHY; post-deadlock soak passed (7 samples, 2026-07-04)
+- Local fixes #3 (HB_ALLOW_MAINNET) and #6 (spread sanity) implemented but uncommitted/not on VPS
+- Condor/Telegram pending (no TELEGRAM_BOT_TOKEN)
+- 54 tests pass locally
 
 Hard constraints:
 - Testnet only
@@ -167,7 +152,7 @@ Hard constraints:
 - Ask before commit/build/rsync/stop/deploy/start at each gate
 - Deploy NEW bot from hl_testnet_pmm_btc_wide.yml only
 
-Start with read-only VPS audit, then proceed through gated steps with user confirmation.
+Start with user intent: commit/rollout fixes, Condor deploy, or read-only audit.
 ```
 
 ---
@@ -179,7 +164,7 @@ Start with read-only VPS audit, then proceed through gated steps with user confi
 1. In Cursor, start a **Cloud Agent**
 2. Point it at: `https://github.com/pradityaw/hummingbot-api`
 3. Branch: `cursor-hyperliquid-recovery-hardening`
-4. Paste the cloud agent prompt from below
+4. Paste the cloud agent prompt from above
 5. Add secrets if needed:
    - SSH private key for VPS (`168.144.111.10`)
    - Hummingbot API credentials (`admin` / your password)
@@ -197,14 +182,3 @@ Branch is published on the user fork:
 
 - **hummingbot-api:** https://github.com/pradityaw/hummingbot-api/tree/cursor-hyperliquid-recovery-hardening
 - **hyperliquid-condor-mm:** https://github.com/pradityaw/hyperliquid-condor-mm/tree/cursor-hyperliquid-recovery-hardening
-
-Local remotes:
-
-```bash
-# hummingbot-api
-git remote add fork https://github.com/pradityaw/hummingbot-api.git  # if missing
-git push -u fork cursor-hyperliquid-recovery-hardening
-
-# hyperliquid-condor-mm
-git push -u origin cursor-hyperliquid-recovery-hardening
-```
