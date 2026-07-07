@@ -18,6 +18,11 @@ from services.bots_orchestrator import BotsOrchestrator
 from services.docker_service import DockerService
 from utils.bot_archiver import BotArchiver
 from utils.file_system import fs_util
+from utils.mainnet_guard import (
+    MainnetConnectorBlockedError,
+    extract_connector_names_from_mapping,
+    validate_testnet_connectors,
+)
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
@@ -172,6 +177,25 @@ def _read_bot_orders_from_sqlite(bot_name: str, active_only: bool, limit: int) -
         "active_order_count": active_orders,
         "orders": orders,
     }
+
+
+def _validate_deployment_connector_names(controller_config_names: list[str]) -> None:
+    connector_names: set[str] = set()
+    for controller in controller_config_names:
+        config_name = controller if controller.endswith(".yml") else f"{controller}.yml"
+        try:
+            config = fs_util.read_yaml_file(f"conf/controllers/{config_name}")
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Controller configuration '{config_name}' not found",
+            )
+        connector_names.update(extract_connector_names_from_mapping(config))
+
+    try:
+        validate_testnet_connectors(connector_names)
+    except MainnetConnectorBlockedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _extract_recent_order_events(bot_name: str, limit: int) -> list:
@@ -1004,6 +1028,8 @@ async def deploy_v2_controllers(
         # Use the same name with timestamp for the instance to ensure uniqueness
         unique_instance_name = f"{deployment.instance_name}-{timestamp}"
 
+        _validate_deployment_connector_names(deployment.controllers_config)
+
         # Ensure controller config names have .yml extension
         controllers_with_extension = []
         for controller in deployment.controllers_config:
@@ -1065,6 +1091,8 @@ async def deploy_v2_controllers(
 
         return response
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error deploying V2 controllers: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

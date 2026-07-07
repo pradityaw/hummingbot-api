@@ -11,8 +11,10 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 
 try:
     from scripts.connectivity_resilience import RuntimeConnectivityGuard
+    from scripts.mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
 except ModuleNotFoundError:
     from connectivity_resilience import RuntimeConnectivityGuard
+    from mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
 
 
 class V2WithControllersConfig(StrategyV2ConfigBase):
@@ -36,6 +38,7 @@ class V2WithControllers(StrategyV2Base):
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: V2WithControllersConfig):
         super().__init__(connectors, config)
+        self._enforce_testnet_connector_guard()
         self.config = config
         self.max_pnl_by_controller = {}
         self.max_global_pnl = Decimal("0")
@@ -43,6 +46,14 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self.connectivity_guard = RuntimeConnectivityGuard(connectors=self.connectors)
+
+    def _enforce_testnet_connector_guard(self) -> None:
+        connector_names = set(self.connectors.keys())
+        for controller in self.controllers.values():
+            connector_names.update(
+                extract_connector_names_from_mapping(controller.config.model_dump())
+            )
+        validate_testnet_connectors(connector_names)
 
     def on_tick(self):
         connectivity_snapshot = self.connectivity_guard.evaluate(self.current_timestamp)
