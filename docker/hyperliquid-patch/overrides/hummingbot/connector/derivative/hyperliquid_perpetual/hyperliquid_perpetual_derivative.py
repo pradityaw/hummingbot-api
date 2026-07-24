@@ -674,8 +674,12 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
     def _runtime_quoting_enabled(self) -> bool:
         return bool(getattr(self, "_hb_runtime_quoting_enabled", True))
 
-    def _ensure_runtime_quoting_enabled(self) -> None:
-        if not self._runtime_quoting_enabled():
+    def _gate_allows(self, position_action: Optional[PositionAction] = None) -> bool:
+        # Fail-closed: only an explicit CLOSE (reduce-only) may bypass the gate.
+        return self._runtime_quoting_enabled() or position_action == PositionAction.CLOSE
+
+    def _ensure_runtime_quoting_enabled(self, position_action: Optional[PositionAction] = None) -> None:
+        if not self._gate_allows(position_action):
             raise IOError("Quoting disabled by runtime connectivity guard")
 
     def buy(self,
@@ -694,7 +698,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
         :return: the id assigned by the connector to the order (the client id)
         """
-        self._ensure_runtime_quoting_enabled()
+        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"))
         order_id = get_new_client_order_id(
             is_buy=True,
             trading_pair=trading_pair,
@@ -732,7 +736,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         :param price: the order price
         :return: the id assigned by the connector to the order (the client id)
         """
-        self._ensure_runtime_quoting_enabled()
+        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"))
         order_id = get_new_client_order_id(
             is_buy=False,
             trading_pair=trading_pair,
@@ -767,7 +771,7 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             position_action: PositionAction = PositionAction.NIL,
             **kwargs,
     ) -> Tuple[str, float]:
-        self._ensure_runtime_quoting_enabled()
+        self._ensure_runtime_quoting_enabled(position_action)
 
         coin = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         param_order_type = {"limit": {"tif": "Gtc"}}

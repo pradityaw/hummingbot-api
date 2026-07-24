@@ -20,11 +20,18 @@ STUCK_RECOVERING_SECONDS="${STUCK_RECOVERING_SECONDS:-1800}"
 STALLED_RUNTIME_SECONDS="${STALLED_RUNTIME_SECONDS:-180}"
 STARTUP_GRACE_SECONDS="${STARTUP_GRACE_SECONDS:-180}"
 HYPERLIQUID_INFO_URL="${HYPERLIQUID_INFO_URL:-https://api.hyperliquid-testnet.xyz/info}"
+HYPERLIQUID_WALLET="${HYPERLIQUID_WALLET:-${MASTER_WALLET:-}}"
+HB_WATCHDOG_AUTO_RESTART="${HB_WATCHDOG_AUTO_RESTART:-0}"
+HB_WATCHDOG_AUTO_RESTART_MAX="${HB_WATCHDOG_AUTO_RESTART_MAX:-3}"
+HB_WATCHDOG_AUTO_RESTART_WINDOW_SECONDS="${HB_WATCHDOG_AUTO_RESTART_WINDOW_SECONDS:-86400}"
 HEALTH_JSON_PATH="${HEALTH_JSON_PATH:-}"
 ORDERS_JSON_PATH="${ORDERS_JSON_PATH:-}"
 CONNECTIVITY_JSON_PATH="${CONNECTIVITY_JSON_PATH:-}"
 LOG_PATH_OVERRIDE="${LOG_PATH_OVERRIDE:-}"
 HYPERLIQUID_INFO_HTTP_CODE_OVERRIDE="${HYPERLIQUID_INFO_HTTP_CODE_OVERRIDE:-}"
+EXCHANGE_POSITION_COUNT_OVERRIDE="${EXCHANGE_POSITION_COUNT_OVERRIDE:-}"
+EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE="${EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE:-}"
+DOCKER_CONTAINER_NAME_OVERRIDE="${DOCKER_CONTAINER_NAME_OVERRIDE:-}"
 NOW_EPOCH_OVERRIDE="${NOW_EPOCH_OVERRIDE:-}"
 SKIP_STATUS_ARCHIVE="${SKIP_STATUS_ARCHIVE:-false}"
 DRY_RUN=false
@@ -63,6 +70,117 @@ join_or_none() {
       printf ' %s' "$item"
     done
   fi
+}
+
+is_enabled_flag() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_testnet_info_url() {
+  case "$1" in
+    *hyperliquid-testnet*|*testnet.xyz*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+query_exchange_exposure() {
+  local info_url="$1"
+  local wallet="$2"
+  python3 - "$info_url" "$wallet" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+info_url, wallet = sys.argv[1], sys.argv[2]
+headers = {"Content-Type": "application/json"}
+
+def post(payload):
+    req = urllib.request.Request(
+        info_url,
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        return json.loads(resp.read().decode())
+
+try:
+    clearinghouse = post({"type": "clearinghouseState", "user": wallet})
+    open_orders = post({"type": "openOrders", "user": wallet})
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": f"{type(exc).__name__}:{exc}", "position_count": -1, "open_order_count": -1}))
+    raise SystemExit(0)
+
+position_count = 0
+for entry in clearinghouse.get("assetPositions") or []:
+    position = entry.get("position") or {}
+    try:
+        size = float(position.get("szi") or 0)
+    except (TypeError, ValueError):
+        size = 0.0
+    if size != 0:
+        position_count += 1
+
+if not isinstance(open_orders, list):
+    print(json.dumps({"ok": False, "error": "open_orders_not_list", "position_count": position_count, "open_order_count": -1}))
+    raise SystemExit(0)
+
+print(json.dumps({
+    "ok": True,
+    "error": "",
+    "position_count": position_count,
+    "open_order_count": len(open_orders),
+}))
+PY
+}
+
+load_restart_budget_epochs() {
+  local state_file="$1"
+  local cutoff_epoch="$2"
+  if [ ! -f "$state_file" ]; then
+    return 0
+  fi
+  while IFS= read -r epoch || [ -n "$epoch" ]; do
+    case "$epoch" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+    if [ "$epoch" -ge "$cutoff_epoch" ]; then
+      printf '%s\n' "$epoch"
+    fi
+  done < "$state_file"
+}
+
+persist_restart_budget_epochs() {
+  local state_file="$1"
+  shift
+  if [ "$#" -eq 0 ]; then
+    : > "$state_file"
+  else
+    printf '%s\n' "$@" > "$state_file"
+  fi
+}
+
+resolve_docker_container_name() {
+  local expected_name="$1"
+  if [ -n "$DOCKER_CONTAINER_NAME_OVERRIDE" ]; then
+    printf '%s\n' "$DOCKER_CONTAINER_NAME_OVERRIDE"
+    return 0
+  fi
+  docker inspect --format '{{.Name}}' "$expected_name" 2>/dev/null | sed 's#^/##'
 }
 
 json_get() {
@@ -518,14 +636,141 @@ EOF
   fi
 fi
 
+bot_name_match=true
+if [ -n "$runtime_bot_name" ] && [ "$runtime_bot_name" != "$bot_name" ]; then
+  bot_name_match=false
+fi
+
+auto_restart_enabled=false
+auto_restart_evaluated=false
+auto_restart_declined_reasons=()
+restart_budget_used=0
+restart_budget_max="$HB_WATCHDOG_AUTO_RESTART_MAX"
+restart_response=""
+exchange_position_count=""
+exchange_open_order_count=""
+exchange_exposure_error=""
+restart_budget_file="$STATE_DIR/auto_restart_epochs"
+
+if is_enabled_flag "$HB_WATCHDOG_AUTO_RESTART"; then
+  auto_restart_enabled=true
+fi
+
+# Gated auto-recovery: only docker restart (never MQTT/API start-bot). Default OFF.
+if [ "$auto_restart_enabled" = true ] && [ "$bot_status" != "running" ] && [ "$action" = "none" ]; then
+  auto_restart_evaluated=true
+  restart_budget_cutoff=$((now_epoch - HB_WATCHDOG_AUTO_RESTART_WINDOW_SECONDS))
+  restart_budget_epochs=()
+  while IFS= read -r restart_epoch || [ -n "${restart_epoch:-}" ]; do
+    [ -z "${restart_epoch:-}" ] && continue
+    restart_budget_epochs+=("$restart_epoch")
+  done < <(load_restart_budget_epochs "$restart_budget_file" "$restart_budget_cutoff")
+  restart_budget_used="${#restart_budget_epochs[@]}"
+
+  if [ -z "$BOT_NAME" ] || [ "$BOT_NAME" != "$bot_name" ]; then
+    auto_restart_declined_reasons+=("bot_name_identity_mismatch")
+  fi
+  if [ "$bot_name_match" != true ]; then
+    auto_restart_declined_reasons+=("runtime_bot_name_mismatch")
+  fi
+  if ! is_testnet_info_url "$HYPERLIQUID_INFO_URL"; then
+    auto_restart_declined_reasons+=("not_testnet")
+  fi
+  if [ "$hl_code" != "200" ]; then
+    auto_restart_declined_reasons+=("exchange_connectivity_unhealthy:${hl_code}")
+  fi
+
+  exposure_query_failed=false
+  if [ -n "$EXCHANGE_POSITION_COUNT_OVERRIDE" ] || [ -n "$EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE" ]; then
+    exchange_position_count="${EXCHANGE_POSITION_COUNT_OVERRIDE:-0}"
+    exchange_open_order_count="${EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE:-0}"
+  elif [ -z "$HYPERLIQUID_WALLET" ]; then
+    auto_restart_declined_reasons+=("wallet_unset")
+    exchange_position_count="-1"
+    exchange_open_order_count="-1"
+    exchange_exposure_error="wallet_unset"
+    exposure_query_failed=true
+  else
+    exposure_json="$(query_exchange_exposure "$HYPERLIQUID_INFO_URL" "$HYPERLIQUID_WALLET")"
+    exchange_position_count="$(printf '%s' "$exposure_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("position_count", -1))')"
+    exchange_open_order_count="$(printf '%s' "$exposure_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("open_order_count", -1))')"
+    exposure_ok="$(printf '%s' "$exposure_json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("ok", False)).lower())')"
+    exchange_exposure_error="$(printf '%s' "$exposure_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error", ""))')"
+    if [ "$exposure_ok" != "true" ]; then
+      auto_restart_declined_reasons+=("exchange_exposure_query_failed")
+      exposure_query_failed=true
+    fi
+  fi
+
+  if [ "$exposure_query_failed" != true ]; then
+    if [ "$exchange_position_count" = "0" ]; then
+      :
+    elif [ "$exchange_position_count" -gt 0 ] 2>/dev/null; then
+      auto_restart_declined_reasons+=("open_position:${exchange_position_count}")
+    else
+      auto_restart_declined_reasons+=("position_count_unknown")
+    fi
+    if [ "$exchange_open_order_count" = "0" ]; then
+      :
+    elif [ "$exchange_open_order_count" -gt 0 ] 2>/dev/null; then
+      auto_restart_declined_reasons+=("exchange_open_orders:${exchange_open_order_count}")
+    else
+      auto_restart_declined_reasons+=("open_order_count_unknown")
+    fi
+  fi
+
+  if [ "$restart_budget_used" -ge "$restart_budget_max" ]; then
+    auto_restart_declined_reasons+=("CRITICAL_restart_budget_exhausted:${restart_budget_used}/${restart_budget_max}")
+  fi
+
+  container_name="$(resolve_docker_container_name "$bot_name" || true)"
+  if [ -z "$container_name" ]; then
+    auto_restart_declined_reasons+=("container_missing")
+  elif [ "$container_name" != "$bot_name" ]; then
+    auto_restart_declined_reasons+=("container_name_mismatch:${container_name}")
+  fi
+
+  if [ "${#auto_restart_declined_reasons[@]}" -eq 0 ]; then
+    if [ "$DRY_RUN" = true ]; then
+      action="would_restart_bot"
+    else
+      action="restart_bot"
+      if restart_response="$(docker restart "$bot_name" 2>&1)"; then
+        restart_budget_epochs+=("$now_epoch")
+        persist_restart_budget_epochs "$restart_budget_file" "${restart_budget_epochs[@]}"
+        restart_budget_used="${#restart_budget_epochs[@]}"
+      else
+        action="none"
+        auto_restart_declined_reasons+=("docker_restart_failed")
+      fi
+    fi
+  fi
+fi
+
 stop_response_json="$(printf '%s' "$stop_response" | json_escape)"
+restart_response_json="$(printf '%s' "$restart_response" | json_escape)"
 runtime_reason_json="$(printf '%s' "$runtime_reason" | json_escape)"
 runtime_readiness_reason_json="$(printf '%s' "$runtime_readiness_reason" | json_escape)"
 runtime_watchdog_reason_json="$(printf '%s' "$runtime_watchdog_reason" | json_escape)"
 runtime_ws_close_reason_json="$(printf '%s' "$runtime_ws_close_reason" | json_escape)"
-bot_name_match=true
-if [ -n "$runtime_bot_name" ] && [ "$runtime_bot_name" != "$bot_name" ]; then
-  bot_name_match=false
+auto_restart_declined_json="$(array_to_json "${auto_restart_declined_reasons[@]+"${auto_restart_declined_reasons[@]}"}")"
+exchange_exposure_error_json="$(printf '%s' "$exchange_exposure_error" | json_escape)"
+
+auto_restart_status_fields=""
+if [ "$auto_restart_enabled" = true ]; then
+  auto_restart_status_fields="$(cat <<EOF
+,
+  "auto_restart_enabled": true,
+  "auto_restart_evaluated": $auto_restart_evaluated,
+  "auto_restart_declined_reasons": $auto_restart_declined_json,
+  "restart_budget_used": $restart_budget_used,
+  "restart_budget_max": $restart_budget_max,
+  "exchange_position_count": $(printf '%s' "${exchange_position_count:-null}"),
+  "exchange_open_order_count": $(printf '%s' "${exchange_open_order_count:-null}"),
+  "exchange_exposure_error": $exchange_exposure_error_json,
+  "restart_response": $restart_response_json
+EOF
+)"
 fi
 
 status_file="$STATUS_DIR/latest.json"
@@ -581,7 +826,7 @@ cat > "$tmp_status" <<EOF
   "dry_run": $DRY_RUN,
   "action": "$action",
   "stop_suppressed_reason": "$(printf '%s' "$stop_suppressed_reason")",
-  "stop_response": $stop_response_json
+  "stop_response": $stop_response_json$auto_restart_status_fields
 }
 EOF
 mv "$tmp_status" "$status_file"
@@ -591,6 +836,10 @@ fi
 
 if [ "$action" = "stop_bot" ] || [ "$action" = "would_stop_bot" ]; then
   echo "bot_name=$bot_name action=$action reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count"
+elif [ "$action" = "restart_bot" ] || [ "$action" = "would_restart_bot" ]; then
+  echo "bot_name=$bot_name action=$action reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") degraded=$(join_or_none "${degraded_reasons[@]+"${degraded_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count suppressed=${stop_suppressed_reason:-none} exchange_positions=${exchange_position_count:-unknown} exchange_open_orders=${exchange_open_order_count:-unknown} restart_budget=${restart_budget_used}/${restart_budget_max}"
+elif [ "$auto_restart_evaluated" = true ]; then
+  echo "bot_name=$bot_name action=none reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") degraded=$(join_or_none "${degraded_reasons[@]+"${degraded_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count suppressed=${stop_suppressed_reason:-none} auto_restart_declined=$(join_or_none "${auto_restart_declined_reasons[@]+"${auto_restart_declined_reasons[@]}"}") exchange_positions=${exchange_position_count:-unknown} exchange_open_orders=${exchange_open_order_count:-unknown} restart_budget=${restart_budget_used}/${restart_budget_max}"
 else
   echo "bot_name=$bot_name action=none reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") degraded=$(join_or_none "${degraded_reasons[@]+"${degraded_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count suppressed=${stop_suppressed_reason:-none}"
 fi

@@ -1,10 +1,10 @@
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.event.events import MarketOrderFailureEvent
+from hummingbot.core.event.events import MarketOrderFailureEvent, PositionAction
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
@@ -15,6 +15,10 @@ try:
 except ModuleNotFoundError:
     from connectivity_resilience import RuntimeConnectivityGuard
     from mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
+
+
+_MARKETS_WHITELIST_ERROR_MARKER = "not in the whitelisted markets set"
+_S_DECIMAL_NAN = Decimal("NaN")
 
 
 class V2WithControllersConfig(StrategyV2ConfigBase):
@@ -89,14 +93,27 @@ class V2WithControllers(StrategyV2Base):
             else:
                 current_drawdown = last_max_pnl - controller_pnl
                 if current_drawdown > self.config.max_controller_drawdown_quote:
-                    self.logger().info(f"Controller {controller_id} reached max drawdown. Stopping the controller.")
+                    self.logger().info(
+                        f"Controller {controller_id} reached max drawdown. "
+                        "Stopping the controller and flattening open positions."
+                    )
                     controller.stop()
-                    executors_order_placed = self.filter_executors(
+                    # Flatten ALL active executors (including trading/open positions).
+                    # Previously only non-trading executors were stopped, which left
+                    # filled inventory riding barriers after a controller breach.
+                    executors_to_stop = self.filter_executors(
                         executors=self.get_executors_by_controller(controller_id),
-                        filter_func=lambda x: x.is_active and not x.is_trading,
+                        filter_func=lambda x: x.is_active or bool(getattr(x, "is_trading", False)),
                     )
                     self.executor_orchestrator.execute_actions(
-                        actions=[StopExecutorAction(controller_id=controller_id, executor_id=executor.id) for executor in executors_order_placed]
+                        actions=[
+                            StopExecutorAction(
+                                controller_id=controller_id,
+                                executor_id=executor.id,
+                                keep_position=False,
+                            )
+                            for executor in executors_to_stop
+                        ]
                     )
                     self.drawdown_exited_controllers.append(controller_id)
 
@@ -138,7 +155,8 @@ class V2WithControllers(StrategyV2Base):
                 executors_to_stop = self.get_executors_by_controller(controller_id)
                 self.executor_orchestrator.execute_actions(
                     [StopExecutorAction(executor_id=executor.id,
-                                        controller_id=executor.controller_id) for executor in executors_to_stop])
+                                        controller_id=executor.controller_id,
+                                        keep_position=False) for executor in executors_to_stop])
             if not controller.config.manual_kill_switch and controller.status == RunnableStatus.TERMINATED:
                 if controller_id in self.drawdown_exited_controllers:
                     continue
@@ -160,7 +178,8 @@ class V2WithControllers(StrategyV2Base):
             )
             self.executor_orchestrator.execute_actions(
                 [StopExecutorAction(executor_id=executor.id,
-                                    controller_id=executor.controller_id) for executor in non_trading_executors])
+                                    controller_id=executor.controller_id,
+                                    keep_position=False) for executor in non_trading_executors])
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         return []
@@ -188,7 +207,8 @@ class V2WithControllers(StrategyV2Base):
         """
         Handle order failure events by logging the error and stopping the strategy if necessary.
         """
-        if order_failed_event.error_message and "position side" in order_failed_event.error_message.lower():
+        error_message = getattr(order_failed_event, "error_message", None) or ""
+        if error_message and "position side" in error_message.lower():
             connectors_position_mode = {}
             for controller_id, controller in self.controllers.items():
                 config_dict = controller.config.model_dump()
@@ -198,3 +218,229 @@ class V2WithControllers(StrategyV2Base):
                             connectors_position_mode[config_dict["connector_name"]] = config_dict["position_mode"]
             for connector_name, position_mode in connectors_position_mode.items():
                 self.connectors[connector_name].set_position_mode(position_mode)
+            return
+
+        # Surface close/open placement failures loudly so operators can act.
+        if self._is_stop_triggered or self._looks_like_close_failure(error_message):
+            self.logger().error(
+                "ORDER PLACEMENT FAILED DURING SHUTDOWN/CLOSE: "
+                f"order_id={getattr(order_failed_event, 'order_id', None)} "
+                f"error={error_message!r}. "
+                "If a position remains open on the exchange, close it manually."
+            )
+
+    async def on_stop(self):
+        """
+        Flatten open positions while markets are still whitelisted, then tear down.
+
+        Base-image PositionExecutors can keep retrying close orders after markets are
+        removed from the strategy whitelist, leaving inventory stranded. We issue
+        flatten stops first, wait for orchestrator shutdown, then loudly report and
+        force-terminate any lingering executors so they cannot retry forever after
+        teardown.
+        """
+        self._is_stop_triggered = True
+        self.logger().info("Strategy stop: stopping controllers and flattening executors before market teardown.")
+
+        for controller_id, controller in self.controllers.items():
+            try:
+                controller.stop()
+            except Exception:
+                self.logger().exception(f"Failed to stop controller {controller_id} during strategy shutdown.")
+
+        self._issue_flatten_stop_actions(reason="strategy_on_stop")
+
+        listen_task = getattr(self, "listen_to_executor_actions_task", None)
+        if listen_task is not None:
+            listen_task.cancel()
+
+        try:
+            await self.executor_orchestrator.stop(self.max_executors_close_attempts)
+        except Exception:
+            self.logger().exception("Executor orchestrator stop failed during strategy shutdown.")
+
+        stranded = self._collect_open_position_executors()
+        if stranded:
+            self.logger().error(
+                "STRANDED POSITION(S) AFTER STRATEGY STOP: close could not complete before "
+                "market teardown. Manual intervention required on the exchange. "
+                f"details={self._format_executor_summaries(stranded)}"
+            )
+        else:
+            self.logger().info("Strategy stop: no open executor positions remain after flatten attempt.")
+
+        market_data_provider = getattr(self, "market_data_provider", None)
+        if market_data_provider is not None:
+            market_data_provider.stop()
+
+        store_all = getattr(self.executor_orchestrator, "store_all_executors", None)
+        if callable(store_all):
+            store_all()
+
+        if getattr(self, "mqtt_enabled", False) and getattr(self, "_pub", None):
+            self._pub({controller_id: {} for controller_id in self.controllers.keys()})
+            self._pub = None
+
+    def buy(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type,
+        price=_S_DECIMAL_NAN,
+        position_action=PositionAction.OPEN,
+    ) -> str:
+        try:
+            return super().buy(
+                connector_name, trading_pair, amount, order_type, price, position_action=position_action
+            )
+        except ValueError as exc:
+            self._handle_order_placement_failure(
+                side="buy",
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                amount=amount,
+                position_action=position_action,
+                error=exc,
+            )
+            raise
+
+    def sell(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type,
+        price=_S_DECIMAL_NAN,
+        position_action=PositionAction.OPEN,
+    ) -> str:
+        try:
+            return super().sell(
+                connector_name, trading_pair, amount, order_type, price, position_action=position_action
+            )
+        except ValueError as exc:
+            self._handle_order_placement_failure(
+                side="sell",
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                amount=amount,
+                position_action=position_action,
+                error=exc,
+            )
+            raise
+
+    def _issue_flatten_stop_actions(self, reason: str) -> None:
+        executors = self.filter_executors(
+            executors=self.get_all_executors(),
+            filter_func=lambda executor: (
+                not bool(getattr(executor, "is_closed", False))
+                and getattr(executor, "status", None) != RunnableStatus.TERMINATED
+            ),
+        )
+        if not executors:
+            self.logger().info(f"No active executors to flatten ({reason}).")
+            return
+
+        actions = [
+            StopExecutorAction(
+                executor_id=executor.id,
+                controller_id=getattr(executor, "controller_id", "main"),
+                keep_position=False,
+            )
+            for executor in executors
+        ]
+        self.logger().info(
+            f"Issuing flatten StopExecutorAction for {len(actions)} executor(s) "
+            f"before teardown ({reason}): {self._format_executor_summaries(executors)}"
+        )
+        self.executor_orchestrator.execute_actions(actions)
+
+    def _collect_open_position_executors(self) -> List[Any]:
+        return self.filter_executors(
+            executors=self.get_all_executors(),
+            filter_func=lambda executor: self._executor_has_open_position(executor),
+        )
+
+    @staticmethod
+    def _executor_has_open_position(executor: Any) -> bool:
+        if bool(getattr(executor, "is_closed", False)):
+            return False
+        if bool(getattr(executor, "is_trading", False)):
+            return True
+        # Requiring a non-zero fill keeps the stranded-position ERROR
+        # meaningful: an unfilled executor still winding down is not a stranded
+        # position, and crying wolf here trains operators to ignore the one log
+        # line that matters.
+        filled = V2WithControllers._executor_fill_amount(executor)
+        if filled is None:
+            return False
+        try:
+            return Decimal(str(filled)) > 0
+        except (ArithmeticError, TypeError, ValueError):
+            return bool(filled)
+
+    @staticmethod
+    def _executor_fill_amount(executor: Any) -> Any:
+        """Fill size of an executor. get_all_executors() yields ExecutorInfo,
+        which reports filled_amount_quote; PositionExecutor itself exposes
+        open_filled_amount."""
+        filled = getattr(executor, "filled_amount_quote", None)
+        if filled is None:
+            filled = getattr(executor, "open_filled_amount", None)
+        return filled
+
+    def _handle_order_placement_failure(
+        self,
+        side: str,
+        connector_name: str,
+        trading_pair: str,
+        amount: Decimal,
+        position_action: Any,
+        error: Exception,
+    ) -> None:
+        action_name = getattr(position_action, "name", str(position_action))
+        message = str(error)
+        if _MARKETS_WHITELIST_ERROR_MARKER in message:
+            self.logger().error(
+                "CLOSE/ORDER FAILED: market already removed from strategy whitelist. "
+                f"side={side} connector={connector_name} pair={trading_pair} amount={amount} "
+                f"position_action={action_name} error={message}. "
+                "Position may be stranded on the exchange — close it manually. "
+                f"open_executors={self._format_executor_summaries(self._collect_open_position_executors())}"
+            )
+            return
+        if self._is_stop_triggered or self._is_close_position_action(position_action):
+            self.logger().error(
+                "CLOSE/ORDER FAILED during strategy shutdown/close path. "
+                f"side={side} connector={connector_name} pair={trading_pair} amount={amount} "
+                f"position_action={action_name} error={message}. "
+                "If a position remains open on the exchange, close it manually."
+            )
+
+    @staticmethod
+    def _is_close_position_action(position_action: Any) -> bool:
+        action_name = getattr(position_action, "name", str(position_action)).upper()
+        return "CLOSE" in action_name
+
+    @staticmethod
+    def _looks_like_close_failure(error_message: str) -> bool:
+        lowered = (error_message or "").lower()
+        return _MARKETS_WHITELIST_ERROR_MARKER in lowered or "close" in lowered
+
+    @staticmethod
+    def _format_executor_summaries(executors: List[Any]) -> List[Dict[str, Any]]:
+        summaries: List[Dict[str, Any]] = []
+        for executor in executors:
+            config = getattr(executor, "config", None)
+            summaries.append(
+                {
+                    "executor_id": getattr(executor, "id", None),
+                    "controller_id": getattr(executor, "controller_id", None),
+                    "status": str(getattr(executor, "status", None)),
+                    "is_trading": bool(getattr(executor, "is_trading", False)),
+                    "filled_amount": str(V2WithControllers._executor_fill_amount(executor)),
+                    "connector_name": getattr(config, "connector_name", None),
+                    "trading_pair": getattr(config, "trading_pair", None),
+                }
+            )
+        return summaries

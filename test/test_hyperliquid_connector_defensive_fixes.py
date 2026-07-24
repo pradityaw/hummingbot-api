@@ -107,6 +107,7 @@ def install_derivative_import_stubs():
         BROKER_ID="HBOT",
         BUILDER_SUPPORTED=False,
         CANCEL_ORDER_URL="/exchange",
+        CREATE_ORDER_URL="/exchange",
         CURRENCY="USD",
         DEPTH_ENDPOINT_NAME="l2Book",
         DOMAIN="hyperliquid_perpetual",
@@ -351,6 +352,173 @@ def test_place_order_rejected_when_runtime_quoting_disabled():
         assert "Quoting disabled" in str(exc)
     else:
         raise AssertionError("Expected _place_order to be rejected when quoting disabled")
+
+
+def _drain_ensure_future(awaitable):
+    if asyncio.iscoroutine(awaitable):
+        awaitable.close()
+    return None
+
+
+def _gated_connector_for_orders(module, monkeypatch):
+    connector = connector_for(module)
+    connector._hb_runtime_quoting_enabled = False
+    connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
+    connector.coin_to_asset = {"BTC": 0}
+    connector.current_timestamp = 123.0
+
+    async def _fake_create_order(*args, **kwargs):
+        return None
+
+    connector._create_order = _fake_create_order
+    monkeypatch.setattr(module, "safe_ensure_future", _drain_ensure_future)
+    return connector
+
+
+async def _ok_place_order_api_post(**kwargs):
+    return {
+        "status": "ok",
+        "response": {"data": {"statuses": [{"resting": {"oid": 999}}]}},
+    }
+
+
+def test_close_orders_allowed_when_runtime_quoting_disabled(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+    connector._api_post = _ok_place_order_api_post
+
+    buy_order_id = module.HyperliquidPerpetualDerivative.buy(
+        connector,
+        trading_pair="BTC-USD",
+        amount=module.Decimal("0.0001"),
+        order_type=module.OrderType.LIMIT,
+        price=module.Decimal("50000"),
+        position_action=module.PositionAction.CLOSE,
+    )
+    sell_order_id = module.HyperliquidPerpetualDerivative.sell(
+        connector,
+        trading_pair="BTC-USD",
+        amount=module.Decimal("0.0001"),
+        order_type=module.OrderType.LIMIT,
+        price=module.Decimal("50000"),
+        position_action=module.PositionAction.CLOSE,
+    )
+    exchange_order_id, timestamp = asyncio.run(
+        module.HyperliquidPerpetualDerivative._place_order(
+            connector,
+            order_id="0xabc",
+            trading_pair="BTC-USD",
+            amount=module.Decimal("0.0001"),
+            trade_type=module.TradeType.SELL,
+            order_type=module.OrderType.LIMIT,
+            price=module.Decimal("50000"),
+            position_action=module.PositionAction.CLOSE,
+        )
+    )
+
+    assert buy_order_id.startswith("0x")
+    assert sell_order_id.startswith("0x")
+    assert exchange_order_id == "999"
+    assert timestamp == 123.0
+
+
+def test_open_orders_still_rejected_when_runtime_quoting_disabled(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+
+    for method_name, call in (
+        (
+            "buy",
+            lambda: module.HyperliquidPerpetualDerivative.buy(
+                connector,
+                trading_pair="BTC-USD",
+                amount=module.Decimal("0.0001"),
+                order_type=module.OrderType.LIMIT,
+                price=module.Decimal("50000"),
+                position_action=module.PositionAction.OPEN,
+            ),
+        ),
+        (
+            "sell",
+            lambda: module.HyperliquidPerpetualDerivative.sell(
+                connector,
+                trading_pair="BTC-USD",
+                amount=module.Decimal("0.0001"),
+                order_type=module.OrderType.LIMIT,
+                price=module.Decimal("50000"),
+                position_action=module.PositionAction.OPEN,
+            ),
+        ),
+        (
+            "_place_order",
+            lambda: asyncio.run(
+                module.HyperliquidPerpetualDerivative._place_order(
+                    connector,
+                    order_id="0xabc",
+                    trading_pair="BTC-USD",
+                    amount=module.Decimal("0.0001"),
+                    trade_type=module.TradeType.BUY,
+                    order_type=module.OrderType.LIMIT,
+                    price=module.Decimal("50000"),
+                    position_action=module.PositionAction.OPEN,
+                )
+            ),
+        ),
+    ):
+        try:
+            call()
+        except (OSError, IOError) as exc:
+            assert "Quoting disabled" in str(exc), method_name
+        else:
+            raise AssertionError(f"Expected {method_name} OPEN to be rejected when quoting disabled")
+
+
+def test_orders_without_position_action_still_rejected_when_gated(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+
+    for method_name, call in (
+        (
+            "buy",
+            lambda: module.HyperliquidPerpetualDerivative.buy(
+                connector,
+                trading_pair="BTC-USD",
+                amount=module.Decimal("0.0001"),
+                order_type=module.OrderType.LIMIT,
+                price=module.Decimal("50000"),
+            ),
+        ),
+        (
+            "sell",
+            lambda: module.HyperliquidPerpetualDerivative.sell(
+                connector,
+                trading_pair="BTC-USD",
+                amount=module.Decimal("0.0001"),
+                order_type=module.OrderType.LIMIT,
+                price=module.Decimal("50000"),
+            ),
+        ),
+        (
+            "_place_order",
+            lambda: asyncio.run(
+                module.HyperliquidPerpetualDerivative._place_order(
+                    connector,
+                    order_id="0xabc",
+                    trading_pair="BTC-USD",
+                    amount=module.Decimal("0.0001"),
+                    trade_type=module.TradeType.BUY,
+                    order_type=module.OrderType.LIMIT,
+                    price=module.Decimal("50000"),
+                )
+            ),
+        ),
+    ):
+        try:
+            call()
+        except (OSError, IOError) as exc:
+            assert "Quoting disabled" in str(exc), method_name
+        else:
+            raise AssertionError(f"Expected {method_name} without position_action to stay gated")
 
 
 def test_api_post_retries_transient_read_request_and_records_attempts(monkeypatch):
