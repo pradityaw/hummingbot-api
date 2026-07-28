@@ -656,3 +656,50 @@ def test_reconciliation_retries_when_open_orders_remain(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert "reconciliation_retry_scheduled" in [event["event_type"] for event in events]
     assert "reconciliation_succeeded" in [event["event_type"] for event in events]
+
+
+class UnpatchedConnector:
+    """Connector without the runtime telemetry hook (unpatched image)."""
+    name = "hyperliquid_perpetual_testnet"
+    network_status = "CONNECTED"
+    _trading_pairs = ["BTC-USD"]
+
+    def __init__(self):
+        self._order_tracker = FakeTracker(0)
+
+
+def test_unpatched_connector_never_enables_quoting(tmp_path):
+    # F5: with no _hb_runtime_connectivity hook, every status reads "unknown"
+    # and all staleness checks skip -- this must gate, not evaluate HEALTHY.
+    connector = UnpatchedConnector()
+    guard = guard_for(tmp_path, connector)
+
+    snapshot = guard.evaluate(1000)
+
+    assert snapshot.state == ConnectivityState.DEGRADED_UNSAFE
+    assert snapshot.quoting_enabled is False
+    assert "runtime_telemetry_missing" in snapshot.reason
+
+
+def test_telemetry_unseen_gates_until_first_updates_arrive(tmp_path):
+    # Patched but freshly booted: the hook exists but no book/user-stream
+    # update has been recorded yet. Quoting stays off until both appear.
+    connector = FakeConnector(runtime={"public_ws_status": "connected",
+                                       "private_ws_status": "connected",
+                                       "rest_health": "healthy"})
+    guard = guard_for(tmp_path, connector, reconnect_required_stable_seconds=0)
+
+    unseen = guard.evaluate(1000)
+    assert unseen.state == ConnectivityState.DEGRADED_UNSAFE
+    assert unseen.quoting_enabled is False
+    assert "runtime_telemetry_unseen" in unseen.reason
+
+    connector._hb_runtime_connectivity["last_order_book_update_timestamp"] = 1000
+    still_unseen = guard.evaluate(1001)
+    assert still_unseen.quoting_enabled is False
+
+    connector._hb_runtime_connectivity["last_user_stream_update_timestamp"] = 1001
+    guard.reconciliation_result = "succeeded"
+    guard.orders_unknown = False
+    recovered = guard.evaluate(1002)
+    assert recovered.quoting_enabled is True
