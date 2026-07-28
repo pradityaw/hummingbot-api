@@ -6,6 +6,7 @@ from starlette import status
 from deps import get_accounts_service
 from models import GatewayWalletCredential, SetDefaultWalletRequest
 from services.accounts_service import AccountsService
+from utils.mainnet_guard import MainnetConnectorBlockedError, validate_testnet_connectors
 
 router = APIRouter(tags=["Accounts"], prefix="/accounts")
 
@@ -128,6 +129,11 @@ async def add_credential(account_name: str, connector_name: str, credentials: Di
     Raises:
         HTTPException: 400 if there's an error adding the credentials
     """
+    try:
+        validate_testnet_connectors([connector_name])
+    except MainnetConnectorBlockedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         await accounts_service.add_credentials(account_name, connector_name, credentials)
         return {"message": "Connector credentials added successfully."}

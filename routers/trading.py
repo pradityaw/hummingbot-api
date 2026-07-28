@@ -24,6 +24,7 @@ from models import (
 )
 from models.accounts import LeverageRequest, PositionModeRequest
 from services.accounts_service import AccountsService
+from utils.mainnet_guard import MainnetConnectorBlockedError, validate_testnet_connectors
 
 router = APIRouter(tags=["Trading"], prefix="/trading")
 
@@ -47,6 +48,11 @@ async def place_trade(
     Raises:
         HTTPException: 400 for invalid parameters, 404 for account/connector not found, 500 for trade execution errors
     """
+    try:
+        validate_testnet_connectors([trade_request.connector_name])
+    except MainnetConnectorBlockedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         # Convert string names to enum instances
         trade_type_enum = TradeType[trade_request.trade_type]
