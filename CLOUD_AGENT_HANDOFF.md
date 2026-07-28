@@ -1,5 +1,22 @@
 # Cloud Agent Handoff — Hyperliquid Recovery Hardening
 
+Date: 2026-07-28 (supersedes the 2026-07-07 sections below where they conflict)
+Branch: `cursor-hyperliquid-recovery-hardening`
+Status: **P1 edge iteration + P2 pre-capital blockers (F2–F8 + executor retry) committed and pushed; 131 tests green; VPS UNTOUCHED (cloud agent had no SSH key). Deploy via `hyperliquid-condor-mm/reports/EDGE_ITERATION_2026-07-28.md` §4 runbook, then Gate C soak per §5.**
+
+What landed on 2026-07-28 (all on the branch):
+- `bots/controllers/market_making/pmm_skewed.py` — maker-only entries (`open_order_type=LIMIT_MAKER` as a real field), inventory skew (reference shift), cooldown after any traded close + FAILED. Stock `pmm_simple` untouched as fallback.
+- `bots/scripts/mid_price_recorder.py` + wiring — bot-side mids → `$HB_CONNECTIVITY_STATE_DIR/mids/` for markout without venue candles.
+- `bots/scripts/drawdown_state.py` + `v2_with_controllers.py` — persisted drawdown state + `max_daily_loss_quote` daily floor (halt+flatten for the UTC day, re-arms next day).
+- F2: mainnet guard now covers deploy-v2-script, MQTT start-bot, POST /trading/orders, add-credential.
+- F3/F8: watchdog verifies stops (escalates to docker stop), identity mismatch is fail-closed.
+- F4/F5: connector gate defaults CLOSED; cancel-err narrowed to known not-found phrases; reduce-by-netting passes the gate for ONEWAY closes.
+- F7: `security_posture_findings` at boot (`HB_ENFORCE_STRONG_SECRETS=1` refuses), debug auth bypass needs `HB_ALLOW_DEBUG_AUTH_BYPASS=1`, base compose pins 127.0.0.1.
+- `docker/hyperliquid-patch/patch_hyperliquid_connector.py` — also patches the base-image `position_executor.py` forever-retry at build (close/open placement exceptions now count toward retries; FAILED + loud stranded ERROR at max).
+- Focused suite: 131 passed (venv: pytest pydantic fastapi pyyaml sqlalchemy aiomqtt pydantic-settings). `test_bot_orchestration_connectivity.py` + 3 router tests in `test_mainnet_guard.py` still need the conda hummingbot env.
+
+---
+
 Date: 2026-07-07
 Branch: `cursor-hyperliquid-recovery-hardening`
 Status: **Fixes #3/#6 committed + live. New bot `hl-testnet-pmm-20260707-113533-20260707-113533` HEALTHY, RESUME_READY, spread guard armed (0.01)**
