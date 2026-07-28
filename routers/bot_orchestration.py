@@ -1084,6 +1084,8 @@ async def deploy_v2_controllers(
             script_config_content["max_global_drawdown_quote"] = deployment.max_global_drawdown_quote
         if deployment.max_controller_drawdown_quote is not None:
             script_config_content["max_controller_drawdown_quote"] = deployment.max_controller_drawdown_quote
+        if deployment.max_daily_loss_quote is not None:
+            script_config_content["max_daily_loss_quote"] = deployment.max_daily_loss_quote
 
         # Save the script config to the scripts directory
         scripts_dir = os.path.join("conf", "scripts")
