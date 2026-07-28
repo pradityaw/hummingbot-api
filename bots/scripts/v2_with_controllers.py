@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.event.events import MarketOrderFailureEvent, PositionAction
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -12,9 +13,11 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 try:
     from scripts.connectivity_resilience import RuntimeConnectivityGuard
     from scripts.mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
+    from scripts.mid_price_recorder import MidPriceRecorder
 except ModuleNotFoundError:
     from connectivity_resilience import RuntimeConnectivityGuard
     from mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
+    from mid_price_recorder import MidPriceRecorder
 
 
 _MARKETS_WHITELIST_ERROR_MARKER = "not in the whitelisted markets set"
@@ -50,6 +53,8 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self.connectivity_guard = RuntimeConnectivityGuard(connectors=self.connectors)
+        self._mid_recorder = MidPriceRecorder()
+        self._last_mid_record_warning = 0.0
 
     def _enforce_testnet_connector_guard(self) -> None:
         connector_names = set(self.connectors.keys())
@@ -60,6 +65,7 @@ class V2WithControllers(StrategyV2Base):
         validate_testnet_connectors(connector_names)
 
     def on_tick(self):
+        self._record_mid_snapshot()
         connectivity_snapshot = self.connectivity_guard.evaluate(self.current_timestamp)
         if not self._is_stop_triggered:
             self.check_manual_kill_switch()
@@ -75,6 +81,36 @@ class V2WithControllers(StrategyV2Base):
         super().on_tick()
         if not self._is_stop_triggered:
             self.send_performance_report()
+
+    def _record_mid_snapshot(self):
+        """
+        Persist connector mid prices every tick (throttled by the recorder) so the
+        analyzer can compute markout without relying on short-retention venue
+        candles. Telemetry must never break the tick: any failure is logged at
+        most once a minute and swallowed.
+        """
+        recorder = getattr(self, "_mid_recorder", None)
+        if recorder is None or not recorder.enabled:
+            return
+        try:
+            samples = []
+            seen = set()
+            for controller in self.controllers.values():
+                config = getattr(controller, "config", None)
+                connector_name = getattr(config, "connector_name", None)
+                trading_pair = getattr(config, "trading_pair", None)
+                if not connector_name or not trading_pair or (connector_name, trading_pair) in seen:
+                    continue
+                seen.add((connector_name, trading_pair))
+                price = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.MidPrice)
+                if price is None:
+                    continue
+                samples.append({"connector": connector_name, "pair": trading_pair, "mid": str(price)})
+            recorder.maybe_record(self.current_timestamp, samples)
+        except Exception as exc:
+            if self.current_timestamp - self._last_mid_record_warning >= 60:
+                self._last_mid_record_warning = self.current_timestamp
+                self.logger().warning(f"Mid-price snapshot failed (markout telemetry degraded): {exc}")
 
     def control_max_drawdown(self):
         if self.config.max_controller_drawdown_quote:

@@ -7,6 +7,7 @@ close failures are surfaced at ERROR instead of being swallowed by silent retrie
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import types
@@ -131,6 +132,11 @@ def _install_hummingbot_stubs() -> None:
     class ConnectorBase:
         pass
 
+    class PriceType(Enum):
+        MidPrice = 1
+        BestBid = 2
+        BestAsk = 3
+
     modules = {
         "hummingbot": types.ModuleType("hummingbot"),
         "hummingbot.client": types.ModuleType("hummingbot.client"),
@@ -138,6 +144,8 @@ def _install_hummingbot_stubs() -> None:
         "hummingbot.connector": types.ModuleType("hummingbot.connector"),
         "hummingbot.connector.connector_base": types.ModuleType("hummingbot.connector.connector_base"),
         "hummingbot.core": types.ModuleType("hummingbot.core"),
+        "hummingbot.core.data_type": types.ModuleType("hummingbot.core.data_type"),
+        "hummingbot.core.data_type.common": types.ModuleType("hummingbot.core.data_type.common"),
         "hummingbot.core.event": types.ModuleType("hummingbot.core.event"),
         "hummingbot.core.event.events": types.ModuleType("hummingbot.core.event.events"),
         "hummingbot.strategy": types.ModuleType("hummingbot.strategy"),
@@ -152,6 +160,7 @@ def _install_hummingbot_stubs() -> None:
 
     modules["hummingbot.client.hummingbot_application"].HummingbotApplication = HummingbotApplication
     modules["hummingbot.connector.connector_base"].ConnectorBase = ConnectorBase
+    modules["hummingbot.core.data_type.common"].PriceType = PriceType
     modules["hummingbot.core.event.events"].MarketOrderFailureEvent = MarketOrderFailureEvent
     modules["hummingbot.core.event.events"].PositionAction = PositionAction
     modules["hummingbot.strategy.strategy_v2_base"].StrategyV2Base = StrategyV2Base
@@ -423,3 +432,56 @@ def test_on_stop_exists_and_mentions_flatten_before_teardown():
     assert "_issue_flatten_stop_actions" in source
     assert "STRANDED POSITION" in source
     assert "keep_position=False" in source
+
+
+class FakeControllerWithMarket(FakeController):
+    def __init__(self, controller_id: str = "ctrl-1"):
+        super().__init__(controller_id)
+        self.config = SimpleNamespace(
+            manual_kill_switch=False,
+            connector_name="hyperliquid_perpetual_testnet",
+            trading_pair="BTC-USD",
+            model_dump=lambda: {},
+        )
+
+
+def _build_mid_strategy(tmp_path) -> V2WithControllers:
+    from mid_price_recorder import MidPriceRecorder
+
+    strategy = _build_strategy({"ctrl-1": []})
+    strategy.controllers["ctrl-1"] = FakeControllerWithMarket("ctrl-1")
+    strategy._mid_recorder = MidPriceRecorder(state_dir=str(tmp_path), interval_seconds=1)
+    strategy._last_mid_record_warning = 0.0
+    snapshot = SimpleNamespace(quoting_enabled=False)
+    strategy.connectivity_guard.evaluate = MagicMock(return_value=snapshot)
+    strategy.connectivity_guard.apply_safety_actions = MagicMock()
+    return strategy
+
+
+def test_on_tick_records_mid_snapshot_even_when_gated(tmp_path):
+    strategy = _build_mid_strategy(tmp_path)
+    strategy.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("60123.5"))
+
+    strategy.on_tick()
+
+    path = tmp_path / "mids" / "mids_19700101.jsonl"
+    payload = json.loads(path.read_text(encoding="utf-8").strip())
+    assert payload["mid"] == "60123.5"
+    assert payload["pair"] == "BTC-USD"
+    assert payload["connector"] == "hyperliquid_perpetual_testnet"
+    strategy.market_data_provider.get_price_by_type.assert_called_once()
+    call_args = strategy.market_data_provider.get_price_by_type.call_args[0]
+    assert call_args[0] == "hyperliquid_perpetual_testnet"
+    assert call_args[1] == "BTC-USD"
+
+
+def test_mid_record_failure_does_not_break_on_tick(tmp_path):
+    strategy = _build_mid_strategy(tmp_path)
+    strategy.market_data_provider.get_price_by_type = MagicMock(side_effect=RuntimeError("book not ready"))
+
+    # Gated path: recorder must swallow the error and the tick must proceed to
+    # safety actions without raising.
+    strategy.on_tick()
+
+    strategy.connectivity_guard.apply_safety_actions.assert_called_once()
+    assert not (tmp_path / "mids").exists()
