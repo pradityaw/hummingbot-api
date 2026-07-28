@@ -4,7 +4,9 @@ services:
     image: hummingbot/hummingbot-api:latest
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # F7: localhost-only by default — this API holds docker.sock (host root).
+      # Remote access goes through the SSH tunnel / tailscale overlays.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./bots:/hummingbot-api/bots
       - /var/run/docker.sock:/var/run/docker.sock
@@ -63,13 +65,15 @@ services:
       - emqx-log:/opt/emqx/log
       - emqx-etc:/opt/emqx/etc
     ports:
-      - "1883:1883"  # mqtt:tcp
-      - "8883:8883"  # mqtt:tcp:ssl
-      - "8083:8083"  # mqtt:ws
-      - "8084:8084"  # mqtt:ws:ssl
-      - "18081:8081"  # http:management
-      - "18083:18083"  # http:dashboard
-      - "61613:61613"  # web-stomp gateway
+      # F7: localhost-only by default; bots reach EMQX over the emqx-bridge
+      # docker network, not these host ports.
+      - "127.0.0.1:1883:1883"  # mqtt:tcp
+      - "127.0.0.1:8883:8883"  # mqtt:tcp:ssl
+      - "127.0.0.1:8083:8083"  # mqtt:ws
+      - "127.0.0.1:8084:8084"  # mqtt:ws:ssl
+      - "127.0.0.1:18081:8081"  # http:management
+      - "127.0.0.1:18083:18083"  # http:dashboard
+      - "127.0.0.1:61613:61613"  # web-stomp gateway
     networks:
       emqx-bridge:
         aliases:
@@ -95,7 +99,8 @@ services:
       # Init script as safety net - only runs on first initialization
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     ports:
-      - "5432:5432"
+      # F7: localhost-only by default.
+      - "127.0.0.1:5432:5432"
     networks:
       - emqx-bridge
     healthcheck:

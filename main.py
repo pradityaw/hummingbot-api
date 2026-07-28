@@ -1,4 +1,5 @@
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -38,7 +39,7 @@ from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger  # noqa
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient  # noqa: E402
 from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES, RateOracle  # noqa: E402
 
-from config import settings  # noqa: E402
+from config import security_posture_findings, settings  # noqa: E402
 from database import AsyncDatabaseManager  # noqa: E402
 from routers import (  # noqa: E402
     accounts,
@@ -87,7 +88,9 @@ logging.getLogger('services.mqtt_manager').setLevel(logging.INFO)
 # Get settings from Pydantic Settings
 username = settings.security.username
 password = settings.security.password
-debug_mode = settings.security.debug_mode
+# F7: the debug auth bypass requires a second explicit opt-in. DEBUG_MODE alone
+# must never silently disable auth on an API that holds docker.sock.
+debug_mode = settings.security.debug_mode and os.environ.get("HB_ALLOW_DEBUG_AUTH_BYPASS") == "1"
 
 # Security setup
 security = HTTPBasic()
@@ -99,6 +102,17 @@ async def lifespan(app: FastAPI):
     Lifespan context manager for the FastAPI application.
     Handles startup and shutdown events.
     """
+    # F7: surface weak security posture loudly at boot; HB_ENFORCE_STRONG_SECRETS=1
+    # turns findings into a hard refusal (required before mainnet capital).
+    posture_findings = security_posture_findings(settings.security)
+    for finding in posture_findings:
+        logging.error("SECURITY POSTURE: %s", finding)
+    if posture_findings and os.environ.get("HB_ENFORCE_STRONG_SECRETS") == "1":
+        raise RuntimeError(
+            "Refusing to start: weak security posture with HB_ENFORCE_STRONG_SECRETS=1 — "
+            + "; ".join(posture_findings)
+        )
+
     # Ensure password verification file exists
     if BackendAPISecurity.new_password_required():
         # Create secrets manager with CONFIG_PASSWORD
