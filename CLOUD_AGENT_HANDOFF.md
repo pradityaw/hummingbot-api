@@ -18,7 +18,6 @@ What landed on 2026-07-28 (all on the branch):
 - Focused suite: 131 passed (venv: pytest pydantic fastapi pyyaml sqlalchemy aiomqtt pydantic-settings). `test_bot_orchestration_connectivity.py` + 3 router tests in `test_mainnet_guard.py` still need the conda hummingbot env.
 
 ---
->>>>>>> fork/cursor-hyperliquid-recovery-hardening
 
 Date: 2026-07-07
 Branch: `cursor-hyperliquid-recovery-hardening`
