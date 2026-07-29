@@ -117,6 +117,9 @@ class V2ControllerDeployment(BaseModel):
     max_controller_drawdown_quote: Optional[float] = Field(
         default=None, description="Maximum allowed per-controller drawdown in quote usually USDT"
     )
+    max_daily_loss_quote: Optional[float] = Field(
+        default=None, description="Maximum allowed loss per UTC day in quote; breaches halt all controllers until next day"
+    )
     image: str = Field(default="hummingbot/hummingbot:latest", description="Docker image for the Hummingbot instance")
     script_config: Optional[str] = Field(default=None, description="Generated script configuration file name")
     headless: bool = Field(default=False, description="Run in headless mode (no UI)")

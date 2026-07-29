@@ -7,6 +7,7 @@ close failures are surfaced at ERROR instead of being swallowed by silent retrie
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import types
@@ -131,6 +132,11 @@ def _install_hummingbot_stubs() -> None:
     class ConnectorBase:
         pass
 
+    class PriceType(Enum):
+        MidPrice = 1
+        BestBid = 2
+        BestAsk = 3
+
     modules = {
         "hummingbot": types.ModuleType("hummingbot"),
         "hummingbot.client": types.ModuleType("hummingbot.client"),
@@ -138,6 +144,8 @@ def _install_hummingbot_stubs() -> None:
         "hummingbot.connector": types.ModuleType("hummingbot.connector"),
         "hummingbot.connector.connector_base": types.ModuleType("hummingbot.connector.connector_base"),
         "hummingbot.core": types.ModuleType("hummingbot.core"),
+        "hummingbot.core.data_type": types.ModuleType("hummingbot.core.data_type"),
+        "hummingbot.core.data_type.common": types.ModuleType("hummingbot.core.data_type.common"),
         "hummingbot.core.event": types.ModuleType("hummingbot.core.event"),
         "hummingbot.core.event.events": types.ModuleType("hummingbot.core.event.events"),
         "hummingbot.strategy": types.ModuleType("hummingbot.strategy"),
@@ -152,6 +160,7 @@ def _install_hummingbot_stubs() -> None:
 
     modules["hummingbot.client.hummingbot_application"].HummingbotApplication = HummingbotApplication
     modules["hummingbot.connector.connector_base"].ConnectorBase = ConnectorBase
+    modules["hummingbot.core.data_type.common"].PriceType = PriceType
     modules["hummingbot.core.event.events"].MarketOrderFailureEvent = MarketOrderFailureEvent
     modules["hummingbot.core.event.events"].PositionAction = PositionAction
     modules["hummingbot.strategy.strategy_v2_base"].StrategyV2Base = StrategyV2Base
@@ -269,6 +278,12 @@ def _build_strategy(executors: Optional[Dict[str, List[FakeExecutor]]] = None) -
     strategy.max_pnl_by_controller = {}
     strategy.max_global_pnl = Decimal("0")
     strategy.drawdown_exited_controllers = []
+    strategy._daily_halt_controllers = []
+    strategy._daily_halt_date = None
+    strategy._daily_anchor_date = None
+    strategy._daily_anchor_pnl = Decimal("0")
+    strategy._drawdown_store = None
+    strategy._last_drawdown_persist = 0.0
     strategy.closed_executors_buffer = 30
     strategy._last_performance_report_timestamp = 0
     strategy.connectivity_guard = MagicMock()
@@ -423,3 +438,147 @@ def test_on_stop_exists_and_mentions_flatten_before_teardown():
     assert "_issue_flatten_stop_actions" in source
     assert "STRANDED POSITION" in source
     assert "keep_position=False" in source
+
+
+class FakeControllerWithMarket(FakeController):
+    def __init__(self, controller_id: str = "ctrl-1"):
+        super().__init__(controller_id)
+        self.config = SimpleNamespace(
+            manual_kill_switch=False,
+            connector_name="hyperliquid_perpetual_testnet",
+            trading_pair="BTC-USD",
+            model_dump=lambda: {},
+        )
+
+
+def _build_mid_strategy(tmp_path) -> V2WithControllers:
+    from mid_price_recorder import MidPriceRecorder
+
+    strategy = _build_strategy({"ctrl-1": []})
+    strategy.controllers["ctrl-1"] = FakeControllerWithMarket("ctrl-1")
+    strategy._mid_recorder = MidPriceRecorder(state_dir=str(tmp_path), interval_seconds=1)
+    strategy._last_mid_record_warning = 0.0
+    snapshot = SimpleNamespace(quoting_enabled=False)
+    strategy.connectivity_guard.evaluate = MagicMock(return_value=snapshot)
+    strategy.connectivity_guard.apply_safety_actions = MagicMock()
+    return strategy
+
+
+def test_on_tick_records_mid_snapshot_even_when_gated(tmp_path):
+    strategy = _build_mid_strategy(tmp_path)
+    strategy.market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("60123.5"))
+
+    strategy.on_tick()
+
+    path = tmp_path / "mids" / "mids_19700101.jsonl"
+    payload = json.loads(path.read_text(encoding="utf-8").strip())
+    assert payload["mid"] == "60123.5"
+    assert payload["pair"] == "BTC-USD"
+    assert payload["connector"] == "hyperliquid_perpetual_testnet"
+    strategy.market_data_provider.get_price_by_type.assert_called_once()
+    call_args = strategy.market_data_provider.get_price_by_type.call_args[0]
+    assert call_args[0] == "hyperliquid_perpetual_testnet"
+    assert call_args[1] == "BTC-USD"
+
+
+def test_mid_record_failure_does_not_break_on_tick(tmp_path):
+    strategy = _build_mid_strategy(tmp_path)
+    strategy.market_data_provider.get_price_by_type = MagicMock(side_effect=RuntimeError("book not ready"))
+
+    # Gated path: recorder must swallow the error and the tick must proceed to
+    # safety actions without raising.
+    strategy.on_tick()
+
+    strategy.connectivity_guard.apply_safety_actions.assert_called_once()
+    assert not (tmp_path / "mids").exists()
+
+
+# --- F6: daily loss floor + persistence -------------------------------------
+
+def test_daily_loss_floor_halts_all_controllers_and_persists(tmp_path):
+    trading = FakeExecutor(executor_id="trading-exec", is_trading=True,
+                           open_filled_amount=Decimal("0.00021"), status=RunnableStatus.RUNNING)
+    strategy = _build_strategy({"ctrl-1": [trading]})
+    from drawdown_state import DrawdownStateStore
+    strategy._drawdown_store = DrawdownStateStore(state_path=str(tmp_path / "dd.json"))
+    strategy.config.max_daily_loss_quote = 5.0
+    # Anchor the day at pnl 10, then drop to 4 -> loss 6 > limit 5.
+    strategy._daily_anchor_date = strategy._utc_today()
+    strategy._daily_anchor_pnl = Decimal("10")
+    strategy.get_performance_report = lambda _cid: SimpleNamespace(global_pnl_quote=Decimal("4"))  # type: ignore[method-assign]
+
+    strategy.check_max_daily_loss()
+
+    assert strategy._daily_halt_active() is True
+    assert strategy._daily_halt_controllers == ["ctrl-1"]
+    assert "ctrl-1" in strategy.drawdown_exited_controllers
+    assert strategy.controllers["ctrl-1"].stop_calls == 1
+    assert any(a.executor_id == "trading-exec" and a.keep_position is False
+               for a in strategy.executor_orchestrator.actions)
+    persisted = strategy._drawdown_store.load()
+    assert persisted["daily_halt_controllers"] == ["ctrl-1"]
+    assert persisted["daily_halt_date"] == strategy._utc_today()
+
+
+def test_daily_floor_anchors_on_first_tick_of_day(tmp_path):
+    strategy = _build_strategy({"ctrl-1": []})
+    strategy.config.max_daily_loss_quote = 5.0
+    strategy.get_performance_report = lambda _cid: SimpleNamespace(global_pnl_quote=Decimal("7"))  # type: ignore[method-assign]
+    assert strategy._daily_anchor_date is None
+
+    strategy.check_max_daily_loss()
+
+    assert strategy._daily_anchor_date == strategy._utc_today()
+    assert strategy._daily_anchor_pnl == Decimal("7")
+    assert strategy._daily_halt_active() is False
+
+
+def test_daily_halt_lifts_next_day_and_rearms_controllers(tmp_path):
+    strategy = _build_strategy({"ctrl-1": []})
+    from drawdown_state import DrawdownStateStore
+    strategy._drawdown_store = DrawdownStateStore(state_path=str(tmp_path / "dd.json"))
+    strategy.config.max_daily_loss_quote = 5.0
+    strategy._daily_halt_controllers = ["ctrl-1"]
+    strategy._daily_halt_date = "2000-01-01"          # halted days ago
+    strategy._daily_anchor_date = "2000-01-01"
+    strategy.drawdown_exited_controllers = ["ctrl-1"]
+    strategy.get_performance_report = lambda _cid: SimpleNamespace(global_pnl_quote=Decimal("0"))  # type: ignore[method-assign]
+
+    assert strategy._daily_halt_active() is False     # halt date is not today
+    strategy.check_max_daily_loss()                   # new-day anchor resets the halt
+
+    assert strategy._daily_halt_controllers == []
+    assert strategy._daily_halt_date is None
+    assert "ctrl-1" not in strategy.drawdown_exited_controllers
+
+
+def test_daily_halt_blocks_kill_switch_restart(tmp_path):
+    strategy = _build_strategy({"ctrl-1": []})
+    strategy.controllers["ctrl-1"].status = RunnableStatus.TERMINATED
+    strategy._daily_halt_controllers = ["ctrl-1"]
+    strategy._daily_halt_date = strategy._utc_today()
+    snapshot = SimpleNamespace(quoting_enabled=False)
+    strategy.connectivity_guard.evaluate = MagicMock(return_value=snapshot)
+
+    strategy.on_tick()
+
+    # Controller must NOT be auto-restarted while the daily halt is active.
+    assert strategy.controllers["ctrl-1"].status == RunnableStatus.TERMINATED
+
+
+def test_drawdown_peaks_restore_from_persisted_state(tmp_path):
+    from drawdown_state import DrawdownStateStore
+    store = DrawdownStateStore(state_path=str(tmp_path / "dd.json"))
+    store.save({
+        "max_pnl_by_controller": {"ctrl-1": "10.5"},
+        "max_global_pnl": "12.5",
+        "drawdown_exited_controllers": ["ctrl-9"],
+        "daily_halt_controllers": [],
+        "daily_halt_date": None,
+        "daily_anchor_date": "2026-07-28",
+        "daily_anchor_pnl": "3.5",
+    })
+    loaded = store.load()
+    assert Decimal(loaded["max_pnl_by_controller"]["ctrl-1"]) == Decimal("10.5")
+    assert Decimal(loaded["max_global_pnl"]) == Decimal("12.5")
+    assert loaded["drawdown_exited_controllers"] == ["ctrl-9"]

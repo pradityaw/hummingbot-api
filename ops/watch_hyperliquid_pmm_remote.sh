@@ -27,6 +27,7 @@ HB_WATCHDOG_AUTO_RESTART_WINDOW_SECONDS="${HB_WATCHDOG_AUTO_RESTART_WINDOW_SECON
 HEALTH_JSON_PATH="${HEALTH_JSON_PATH:-}"
 ORDERS_JSON_PATH="${ORDERS_JSON_PATH:-}"
 CONNECTIVITY_JSON_PATH="${CONNECTIVITY_JSON_PATH:-}"
+STATUS_JSON_PATH="${STATUS_JSON_PATH:-}"
 LOG_PATH_OVERRIDE="${LOG_PATH_OVERRIDE:-}"
 HYPERLIQUID_INFO_HTTP_CODE_OVERRIDE="${HYPERLIQUID_INFO_HTTP_CODE_OVERRIDE:-}"
 EXCHANGE_POSITION_COUNT_OVERRIDE="${EXCHANGE_POSITION_COUNT_OVERRIDE:-}"
@@ -34,6 +35,9 @@ EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE="${EXCHANGE_OPEN_ORDER_COUNT_OVERRIDE:-}"
 DOCKER_CONTAINER_NAME_OVERRIDE="${DOCKER_CONTAINER_NAME_OVERRIDE:-}"
 NOW_EPOCH_OVERRIDE="${NOW_EPOCH_OVERRIDE:-}"
 SKIP_STATUS_ARCHIVE="${SKIP_STATUS_ARCHIVE:-false}"
+STOP_VERIFY_ATTEMPTS="${STOP_VERIFY_ATTEMPTS:-3}"
+STOP_VERIFY_DELAY_SECONDS="${STOP_VERIFY_DELAY_SECONDS:-10}"
+HEALTH_JSON_SEQUENCE_PATH="${HEALTH_JSON_SEQUENCE_PATH:-}"
 DRY_RUN=false
 
 while [ "$#" -gt 0 ]; do
@@ -218,8 +222,25 @@ PY
 
 api_get() {
   local path="$1"
+  if [ "$path" = "/bot-orchestration/${bot_name}/health" ] && [ -n "$HEALTH_JSON_SEQUENCE_PATH" ]; then
+    # Test hook: each call consumes the next JSON line, so health can change
+    # across stop-verification polls within one watchdog run.
+    local seq_line
+    seq_line="$(head -n 1 "$HEALTH_JSON_SEQUENCE_PATH" 2>/dev/null || true)"
+    if [ -n "$seq_line" ]; then
+      tail -n +2 "$HEALTH_JSON_SEQUENCE_PATH" > "$HEALTH_JSON_SEQUENCE_PATH.tmp" 2>/dev/null || true
+      mv "$HEALTH_JSON_SEQUENCE_PATH.tmp" "$HEALTH_JSON_SEQUENCE_PATH" 2>/dev/null || true
+      printf '%s' "$seq_line"
+      return 0
+    fi
+    return 1
+  fi
   if [ "$path" = "/bot-orchestration/${bot_name}/health" ] && [ -n "$HEALTH_JSON_PATH" ]; then
     cat "$HEALTH_JSON_PATH"
+    return 0
+  fi
+  if [ "$path" = "/bot-orchestration/status" ] && [ -n "$STATUS_JSON_PATH" ]; then
+    cat "$STATUS_JSON_PATH"
     return 0
   fi
   if [ "$path" = "/bot-orchestration/${bot_name}/orders?active_only=true&limit=20&event_limit=20" ] && [ -n "$ORDERS_JSON_PATH" ]; then
@@ -618,11 +639,39 @@ if [ "${#hard_reasons[@]}" -gt 0 ]; then
   should_stop=true
 fi
 
+# F8: identity drift is fail-closed. A stale BOT_NAME previously made the
+# watchdog silently monitor a nonexistent bot (or whatever the API answered
+# with). Any mismatch suppresses stops/restarts and fails this run loudly.
+identity_error=""
+if [ -n "$BOT_NAME" ]; then
+  if [ -n "$runtime_bot_name" ] && [ "$runtime_bot_name" != "$bot_name" ]; then
+    identity_error="runtime_bot_name_mismatch:${runtime_bot_name}"
+  elif [ "$api_ok" = false ]; then
+    status_probe="$(api_get "/bot-orchestration/status" || true)"
+    if [ -n "$status_probe" ]; then
+      bot_present="$(printf '%s' "$status_probe" | python3 -c 'import json, sys
+try:
+    data = json.load(sys.stdin).get("data", {})
+    print("true" if sys.argv[1] in data else "false")
+except Exception:
+    print("unknown")' "$bot_name")"
+      if [ "$bot_present" = "false" ]; then
+        identity_error="bot_not_found_on_api:${bot_name}"
+      fi
+    fi
+  fi
+fi
+
+stop_verified=false
+stop_verification_attempts=0
+stop_escalation="none"
 if [ "$should_stop" = true ]; then
   if [ "$bot_status" != "running" ]; then
     stop_suppressed_reason="bot_not_running"
   elif [ "$trading_exposure_active" != true ]; then
     stop_suppressed_reason="no_trading_exposure"
+  elif [ -n "$identity_error" ]; then
+    stop_suppressed_reason="identity_error:${identity_error}"
   elif [ -f "$stop_state_file" ] && [ "$(json_get "$stop_state_file" 'payload.get("run_id", "")')" = "$run_id" ]; then
     stop_suppressed_reason="already_stopped_this_run"
   elif [ "$DRY_RUN" = true ]; then
@@ -630,9 +679,59 @@ if [ "$should_stop" = true ]; then
   else
     action="stop_bot"
     stop_response="$(api_post_json "/bot-orchestration/stop-bot" "{\"bot_name\":\"$bot_name\",\"skip_order_cancellation\":false,\"async_backend\":false}" 2>&1 || true)"
-    cat > "$stop_state_file" <<EOF
-{"run_id":"$run_id","bot_name":"$bot_name","activation_epoch":$activation_epoch,"last_stop_epoch":$now_epoch}
+
+    # F3: the API reports success when the MQTT publish succeeds, not when the
+    # strategy actually stopped — a wedged bot keeps quoting after a "stop".
+    # Verify the stop took effect (strategy not running AND zero active
+    # orders), retrying briefly, then escalate to docker stop.
+    while [ "$stop_verification_attempts" -lt "$STOP_VERIFY_ATTEMPTS" ]; do
+      stop_verification_attempts=$((stop_verification_attempts + 1))
+      sleep "$STOP_VERIFY_DELAY_SECONDS"
+      verify_health="$(api_get "/bot-orchestration/${bot_name}/health" || true)"
+      verify_status="$(printf '%s' "$verify_health" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("data", {}).get("bot_status", "unknown"))
+except Exception:
+    print("unknown")')"
+      verify_orders="$(api_get "/bot-orchestration/${bot_name}/orders?active_only=true&limit=20&event_limit=20" || true)"
+      verify_active="$(printf '%s' "$verify_orders" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("data", {}).get("active_order_count", 0))
+except Exception:
+    print(0)')"
+      if [ "$verify_status" != "running" ] && [ "$verify_active" = "0" ]; then
+        stop_verified=true
+        break
+      fi
+    done
+
+    if [ "$stop_verified" != true ]; then
+      # Escalation path (sanctioned only after API stop verification fails):
+      # pin restart policy off, then graceful docker stop. Never the first move.
+      stop_escalation="docker_stop"
+      container_name="$(resolve_docker_container_name "$bot_name" || true)"
+      if [ -n "$container_name" ] && [ "$container_name" = "$bot_name" ]; then
+        docker update --restart=no "$container_name" >/dev/null 2>&1 || true
+        if docker stop --time 30 "$container_name" >/dev/null 2>&1; then
+          stop_verified=true
+        else
+          stop_escalation="failed"
+        fi
+      else
+        stop_escalation="failed"
+      fi
+    fi
+
+    # Only a verified stop suppresses further stop attempts this run; an
+    # unverified/failed stop is retried by the next watchdog run.
+    if [ "$stop_verified" = true ]; then
+      cat > "$stop_state_file" <<EOF
+{"run_id":"$run_id","bot_name":"$bot_name","activation_epoch":$activation_epoch,"last_stop_epoch":$now_epoch,"escalation":"$stop_escalation"}
 EOF
+    else
+      stop_suppressed_reason="CRITICAL_stop_unverified"
+      action="stop_bot_unverified"
+    fi
   fi
 fi
 
@@ -657,7 +756,7 @@ if is_enabled_flag "$HB_WATCHDOG_AUTO_RESTART"; then
 fi
 
 # Gated auto-recovery: only docker restart (never MQTT/API start-bot). Default OFF.
-if [ "$auto_restart_enabled" = true ] && [ "$bot_status" != "running" ] && [ "$action" = "none" ]; then
+if [ "$auto_restart_enabled" = true ] && [ "$bot_status" != "running" ] && [ "$action" = "none" ] && [ -z "$identity_error" ]; then
   auto_restart_evaluated=true
   restart_budget_cutoff=$((now_epoch - HB_WATCHDOG_AUTO_RESTART_WINDOW_SECONDS))
   restart_budget_epochs=()
@@ -825,7 +924,11 @@ cat > "$tmp_status" <<EOF
   "trading_active": $trading_exposure_active,
   "dry_run": $DRY_RUN,
   "action": "$action",
+  "identity_error": $(printf '%s' "$identity_error" | json_escape),
   "stop_suppressed_reason": "$(printf '%s' "$stop_suppressed_reason")",
+  "stop_verified": $stop_verified,
+  "stop_verification_attempts": $stop_verification_attempts,
+  "stop_escalation": $(printf '%s' "$stop_escalation" | json_escape),
   "stop_response": $stop_response_json$auto_restart_status_fields
 }
 EOF
@@ -834,8 +937,13 @@ if [ "$SKIP_STATUS_ARCHIVE" != "true" ]; then
   cp "$status_file" "$STATUS_DIR/$(date -u +%Y%m%dT%H%M%SZ).json"
 fi
 
+if [ -n "$identity_error" ]; then
+  echo "bot_name=$bot_name action=none identity_error=$identity_error — watchdog identity unverifiable; refusing to act" >&2
+  exit 1
+fi
+
 if [ "$action" = "stop_bot" ] || [ "$action" = "would_stop_bot" ]; then
-  echo "bot_name=$bot_name action=$action reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count"
+  echo "bot_name=$bot_name action=$action reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count verified=$stop_verified escalation=$stop_escalation"
 elif [ "$action" = "restart_bot" ] || [ "$action" = "would_restart_bot" ]; then
   echo "bot_name=$bot_name action=$action reasons=$(join_or_none "${hard_reasons[@]+"${hard_reasons[@]}"}") degraded=$(join_or_none "${degraded_reasons[@]+"${degraded_reasons[@]}"}") active_orders=$active_order_count recent_order_creates=$recent_order_create_count suppressed=${stop_suppressed_reason:-none} exchange_positions=${exchange_position_count:-unknown} exchange_open_orders=${exchange_open_order_count:-unknown} restart_budget=${restart_budget_used}/${restart_budget_max}"
 elif [ "$auto_restart_evaluated" = true ]; then

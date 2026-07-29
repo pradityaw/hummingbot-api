@@ -121,6 +121,30 @@ class AppSettings(BaseSettings):
     )
 
 
+WEAK_CONFIG_PASSWORDS = {"", "a", "admin", "password", "changeme", "hummingbot"}
+
+
+def security_posture_findings(security: SecuritySettings, min_config_password_length: int = 12) -> List[str]:
+    """
+    F7: enumerate weak-security findings before a wallet with real funds is
+    attached. The API holds docker.sock (= VPS root = wallet keys), so default
+    credentials / an auth bypass / a weak CONFIG_PASSWORD are critical findings,
+    not warnings.
+    """
+    findings: List[str] = []
+    if security.username == "admin" and security.password == "admin":
+        findings.append("API basic auth is still the default admin/admin (rotate USERNAME/PASSWORD)")
+    if security.debug_mode:
+        findings.append("DEBUG_MODE is set (with HB_ALLOW_DEBUG_AUTH_BYPASS=1 this fully disables API auth)")
+    config_password = (security.config_password or "")
+    if config_password.lower() in WEAK_CONFIG_PASSWORDS or len(config_password) < min_config_password_length:
+        findings.append(
+            "CONFIG_PASSWORD is weak/default — it is injected into every bot container env "
+            "and is recoverable via docker inspect"
+        )
+    return findings
+
+
 class Settings(BaseSettings):
     """Combined application settings."""
 

@@ -610,3 +610,127 @@ def test_ws_close_metadata_extracts_nested_code_and_reason():
     )
 
     assert runtime_module.extract_ws_close_metadata(ws) == ("1006", "abnormal closure")
+
+
+def test_cancel_err_with_unrelated_message_is_a_cancel_failure_not_not_found():
+    module, _ = load_derivative_module()
+    connector = connector_for(module)
+    connector.coin_to_asset = {"BTC": 0}
+    connector.exchange_symbol_associated_to_pair = lambda trading_pair: asyncio.sleep(0, result="BTC")
+    not_found_calls = []
+    connector._order_tracker = SimpleNamespace(
+        process_order_not_found=lambda order_id: not_found_calls.append(order_id) or asyncio.sleep(0),
+    )
+
+    async def api_post(**kwargs):
+        return {
+            "status": "err",
+            "response": {
+                "type": "cancel",
+                "data": {"statuses": [{"error": "Too many cumulative requests sent"}]},
+            },
+        }
+
+    connector._api_post = api_post
+    tracked_order = SimpleNamespace(trading_pair="BTC-USD")
+
+    try:
+        asyncio.run(module.HyperliquidPerpetualDerivative._place_cancel(connector, "client-order", tracked_order))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("Expected rejected cancel to raise")
+
+    # The live order must stay tracked (no process_order_not_found), and the
+    # failure must feed the guard so quoting gates + reconciles instead.
+    assert not_found_calls == []
+    assert connector._hb_runtime_connectivity.get("cancel_failure_count", 0) == 1
+
+
+def test_gate_is_fail_closed_by_default_when_never_stamped(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+    # Delete the stamp entirely: a bot that never ran the guard must not quote.
+    del connector._hb_runtime_quoting_enabled
+
+    try:
+        module.HyperliquidPerpetualDerivative.buy(
+            connector,
+            trading_pair="BTC-USD",
+            amount=module.Decimal("0.0001"),
+            order_type=module.OrderType.LIMIT,
+            price=module.Decimal("50000"),
+        )
+    except (OSError, IOError) as exc:
+        assert "Quoting disabled" in str(exc)
+    else:
+        raise AssertionError("Expected buy to be rejected when the gate was never stamped")
+
+
+def _set_position(connector, module, amount):
+    connector._perpetual_trading = SimpleNamespace(
+        account_positions={
+            "key": SimpleNamespace(trading_pair="BTC-USD", amount=module.Decimal(str(amount))),
+        }
+    )
+
+
+def test_reduce_by_netting_sell_allowed_when_gated(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+    connector._api_post = _ok_place_order_api_post
+    _set_position(connector, module, "0.0002")
+
+    # ONEWAY close sent as PositionAction.OPEN: sell against a 0.0002 long.
+    order_id = module.HyperliquidPerpetualDerivative.sell(
+        connector,
+        trading_pair="BTC-USD",
+        amount=module.Decimal("0.0001"),
+        order_type=module.OrderType.LIMIT,
+        price=module.Decimal("50000"),
+        position_action=module.PositionAction.OPEN,
+    )
+    assert order_id.startswith("0x")
+
+
+def test_oversized_or_same_direction_orders_still_gated(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+    _set_position(connector, module, "0.0002")
+
+    cases = {
+        # larger than the tracked long: would flip exposure, not reduce it
+        "oversized_sell": lambda: module.HyperliquidPerpetualDerivative.sell(
+            connector, trading_pair="BTC-USD", amount=module.Decimal("0.0003"),
+            order_type=module.OrderType.LIMIT, price=module.Decimal("50000"),
+            position_action=module.PositionAction.OPEN),
+        # same direction as the long: increases exposure
+        "same_direction_buy": lambda: module.HyperliquidPerpetualDerivative.buy(
+            connector, trading_pair="BTC-USD", amount=module.Decimal("0.0001"),
+            order_type=module.OrderType.LIMIT, price=module.Decimal("50000"),
+            position_action=module.PositionAction.OPEN),
+    }
+    for name, call in cases.items():
+        try:
+            call()
+        except (OSError, IOError) as exc:
+            assert "Quoting disabled" in str(exc), name
+        else:
+            raise AssertionError(f"Expected {name} to stay gated")
+
+
+def test_reduce_by_netting_blocked_when_position_unknown(monkeypatch):
+    module, _ = load_derivative_module()
+    connector = _gated_connector_for_orders(module, monkeypatch)
+    # No position cache at all -> cannot prove reduction -> fail closed.
+    connector._perpetual_trading = SimpleNamespace(account_positions={})
+
+    try:
+        module.HyperliquidPerpetualDerivative.sell(
+            connector, trading_pair="BTC-USD", amount=module.Decimal("0.0001"),
+            order_type=module.OrderType.LIMIT, price=module.Decimal("50000"),
+            position_action=module.PositionAction.OPEN)
+    except (OSError, IOError) as exc:
+        assert "Quoting disabled" in str(exc)
+    else:
+        raise AssertionError("Expected sell to stay gated with unknown position")

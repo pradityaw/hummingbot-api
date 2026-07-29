@@ -1,9 +1,11 @@
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.event.events import MarketOrderFailureEvent, PositionAction
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -11,10 +13,14 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 
 try:
     from scripts.connectivity_resilience import RuntimeConnectivityGuard
+    from scripts.drawdown_state import DrawdownStateStore
     from scripts.mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
+    from scripts.mid_price_recorder import MidPriceRecorder
 except ModuleNotFoundError:
     from connectivity_resilience import RuntimeConnectivityGuard
+    from drawdown_state import DrawdownStateStore
     from mainnet_guard import extract_connector_names_from_mapping, validate_testnet_connectors
+    from mid_price_recorder import MidPriceRecorder
 
 
 _MARKETS_WHITELIST_ERROR_MARKER = "not in the whitelisted markets set"
@@ -25,6 +31,7 @@ class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     max_global_drawdown_quote: Optional[float] = None
     max_controller_drawdown_quote: Optional[float] = None
+    max_daily_loss_quote: Optional[float] = None
 
 
 class V2WithControllers(StrategyV2Base):
@@ -50,6 +57,34 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self.connectivity_guard = RuntimeConnectivityGuard(connectors=self.connectors)
+        self._mid_recorder = MidPriceRecorder()
+        self._last_mid_record_warning = 0.0
+        # F6: restore persisted loss-limit state so a restart cannot re-arm the
+        # budget or resurrect drawdown-stopped controllers.
+        self._drawdown_store = DrawdownStateStore()
+        self._daily_halt_controllers: List[str] = []
+        self._daily_halt_date: Optional[str] = None
+        self._daily_anchor_date: Optional[str] = None
+        self._daily_anchor_pnl = Decimal("0")
+        self._last_drawdown_persist = 0.0
+        try:
+            persisted = self._drawdown_store.load()
+        except Exception as exc:
+            self.logger().error(
+                f"DRAWDOWN STATE UNREADABLE ({exc}); running on in-memory defaults. "
+                "Loss budgets are re-armed — investigate the state dir before resuming."
+            )
+            persisted = None
+        if persisted:
+            self.max_pnl_by_controller = {
+                key: Decimal(str(value)) for key, value in persisted.get("max_pnl_by_controller", {}).items()
+            }
+            self.max_global_pnl = Decimal(str(persisted.get("max_global_pnl", "0")))
+            self.drawdown_exited_controllers = list(persisted.get("drawdown_exited_controllers", []))
+            self._daily_halt_controllers = list(persisted.get("daily_halt_controllers", []))
+            self._daily_halt_date = persisted.get("daily_halt_date")
+            self._daily_anchor_date = persisted.get("daily_anchor_date")
+            self._daily_anchor_pnl = Decimal(str(persisted.get("daily_anchor_pnl", "0")))
 
     def _enforce_testnet_connector_guard(self) -> None:
         connector_names = set(self.connectors.keys())
@@ -60,8 +95,9 @@ class V2WithControllers(StrategyV2Base):
         validate_testnet_connectors(connector_names)
 
     def on_tick(self):
+        self._record_mid_snapshot()
         connectivity_snapshot = self.connectivity_guard.evaluate(self.current_timestamp)
-        if not self._is_stop_triggered:
+        if not self._is_stop_triggered and not self._daily_halt_active():
             self.check_manual_kill_switch()
             self.control_max_drawdown()
         if not connectivity_snapshot.quoting_enabled:
@@ -76,11 +112,135 @@ class V2WithControllers(StrategyV2Base):
         if not self._is_stop_triggered:
             self.send_performance_report()
 
+    def _record_mid_snapshot(self):
+        """
+        Persist connector mid prices every tick (throttled by the recorder) so the
+        analyzer can compute markout without relying on short-retention venue
+        candles. Telemetry must never break the tick: any failure is logged at
+        most once a minute and swallowed.
+        """
+        recorder = getattr(self, "_mid_recorder", None)
+        if recorder is None or not recorder.enabled:
+            return
+        try:
+            samples = []
+            seen = set()
+            for controller in self.controllers.values():
+                config = getattr(controller, "config", None)
+                connector_name = getattr(config, "connector_name", None)
+                trading_pair = getattr(config, "trading_pair", None)
+                if not connector_name or not trading_pair or (connector_name, trading_pair) in seen:
+                    continue
+                seen.add((connector_name, trading_pair))
+                price = self.market_data_provider.get_price_by_type(connector_name, trading_pair, PriceType.MidPrice)
+                if price is None:
+                    continue
+                samples.append({"connector": connector_name, "pair": trading_pair, "mid": str(price)})
+            recorder.maybe_record(self.current_timestamp, samples)
+        except Exception as exc:
+            if self.current_timestamp - self._last_mid_record_warning >= 60:
+                self._last_mid_record_warning = self.current_timestamp
+                self.logger().warning(f"Mid-price snapshot failed (markout telemetry degraded): {exc}")
+
+    def _utc_today(self) -> str:
+        return datetime.fromtimestamp(self.current_timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    def _daily_halt_active(self) -> bool:
+        halt_controllers = getattr(self, "_daily_halt_controllers", [])
+        halt_date = getattr(self, "_daily_halt_date", None)
+        return bool(halt_controllers and halt_date and halt_date == self._utc_today())
+
+    def _persist_drawdown_state(self, force: bool = False) -> None:
+        store = getattr(self, "_drawdown_store", None)
+        if store is None:
+            return
+        now = float(getattr(self, "current_timestamp", 0) or 0)
+        if not force and now - getattr(self, "_last_drawdown_persist", 0.0) < 15:
+            return
+        self._last_drawdown_persist = now
+        payload = {
+            "max_pnl_by_controller": {key: str(value) for key, value in self.max_pnl_by_controller.items()},
+            "max_global_pnl": str(self.max_global_pnl),
+            "drawdown_exited_controllers": sorted(set(self.drawdown_exited_controllers)),
+            "daily_halt_controllers": sorted(set(getattr(self, "_daily_halt_controllers", []))),
+            "daily_halt_date": getattr(self, "_daily_halt_date", None),
+            "daily_anchor_date": getattr(self, "_daily_anchor_date", None),
+            "daily_anchor_pnl": str(getattr(self, "_daily_anchor_pnl", Decimal("0"))),
+        }
+        try:
+            store.save(payload)
+        except Exception as exc:
+            self.logger().error(f"Failed to persist drawdown state: {exc}")
+
+    def _global_pnl_quote(self) -> Decimal:
+        return sum(
+            self.get_performance_report(controller_id).global_pnl_quote
+            for controller_id in self.controllers.keys()
+        )
+
     def control_max_drawdown(self):
         if self.config.max_controller_drawdown_quote:
             self.check_max_controller_drawdown()
         if self.config.max_global_drawdown_quote:
             self.check_max_global_drawdown()
+        if self.config.max_daily_loss_quote:
+            self.check_max_daily_loss()
+
+    def check_max_daily_loss(self):
+        """
+        Daily loss floor (F6): peak-to-trough limits alone never reset, so a bad
+        day can bleed the entire budget in one session. The floor anchors global
+        PnL at the first tick of each UTC day; breaching it halts all controllers
+        (flattened) for the rest of the day, and the halt survives restarts via
+        the persisted state. At the next UTC day the halt lifts and controllers
+        re-arm automatically.
+        """
+        today = self._utc_today()
+        current_global_pnl = self._global_pnl_quote()
+        if self._daily_anchor_date != today:
+            self._daily_anchor_date = today
+            self._daily_anchor_pnl = current_global_pnl
+            halted = getattr(self, "_daily_halt_controllers", [])
+            if halted or self._daily_halt_date:
+                self.drawdown_exited_controllers = [
+                    controller_id for controller_id in self.drawdown_exited_controllers
+                    if controller_id not in halted
+                ]
+                self._daily_halt_controllers = []
+                self._daily_halt_date = None
+                self.logger().info("New UTC day: daily loss floor re-armed; daily-halted controllers may restart.")
+            self._persist_drawdown_state(force=True)
+            return
+        daily_loss = self._daily_anchor_pnl - current_global_pnl
+        if daily_loss <= Decimal(str(self.config.max_daily_loss_quote)):
+            return
+        self.logger().info(
+            f"Daily loss floor breached: {daily_loss} quote below the daily anchor "
+            f"(limit {self.config.max_daily_loss_quote}). Halting all controllers until next UTC day."
+        )
+        for controller_id, controller in self.controllers.items():
+            if controller.status != RunnableStatus.RUNNING:
+                continue
+            controller.stop()
+            executors_to_stop = self.filter_executors(
+                executors=self.get_executors_by_controller(controller_id),
+                filter_func=lambda x: x.is_active or bool(getattr(x, "is_trading", False)),
+            )
+            self.executor_orchestrator.execute_actions(
+                actions=[
+                    StopExecutorAction(
+                        controller_id=controller_id,
+                        executor_id=executor.id,
+                        keep_position=False,
+                    )
+                    for executor in executors_to_stop
+                ]
+            )
+            self._daily_halt_controllers.append(controller_id)
+            if controller_id not in self.drawdown_exited_controllers:
+                self.drawdown_exited_controllers.append(controller_id)
+        self._daily_halt_date = today
+        self._persist_drawdown_state(force=True)
 
     def check_max_controller_drawdown(self):
         for controller_id, controller in self.controllers.items():
@@ -90,6 +250,7 @@ class V2WithControllers(StrategyV2Base):
             last_max_pnl = self.max_pnl_by_controller[controller_id]
             if controller_pnl > last_max_pnl:
                 self.max_pnl_by_controller[controller_id] = controller_pnl
+                self._persist_drawdown_state()
             else:
                 current_drawdown = last_max_pnl - controller_pnl
                 if current_drawdown > self.config.max_controller_drawdown_quote:
@@ -116,17 +277,20 @@ class V2WithControllers(StrategyV2Base):
                         ]
                     )
                     self.drawdown_exited_controllers.append(controller_id)
+                    self._persist_drawdown_state(force=True)
 
     def check_max_global_drawdown(self):
-        current_global_pnl = sum([self.get_performance_report(controller_id).global_pnl_quote for controller_id in self.controllers.keys()])
+        current_global_pnl = self._global_pnl_quote()
         if current_global_pnl > self.max_global_pnl:
             self.max_global_pnl = current_global_pnl
+            self._persist_drawdown_state()
         else:
             current_global_drawdown = self.max_global_pnl - current_global_pnl
             if current_global_drawdown > self.config.max_global_drawdown_quote:
                 self.drawdown_exited_controllers.extend(list(self.controllers.keys()))
                 self.logger().info("Global drawdown reached. Stopping the strategy.")
                 self._is_stop_triggered = True
+                self._persist_drawdown_state(force=True)
                 HummingbotApplication.main_application().stop()
 
     def get_controller_report(self, controller_id: str) -> dict:

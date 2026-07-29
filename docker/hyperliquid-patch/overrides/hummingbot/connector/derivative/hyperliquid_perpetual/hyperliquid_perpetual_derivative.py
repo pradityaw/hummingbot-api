@@ -659,11 +659,19 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         status = statuses[0] if statuses else {}
         exchange_status = cancel_result.get("status") if isinstance(cancel_result, dict) else None
         if exchange_status == "err" or (isinstance(status, dict) and "error" in status):
-            self.logger().debug(f"The order {order_id} does not exist on Hyperliquid Perpetuals. "
-                                f"No cancelation needed.")
-            await self._order_tracker.process_order_not_found(order_id)
             error_message = status.get("error", response) if isinstance(status, dict) else response
-            raise IOError(str(error_message))
+            error_text = str(error_message)
+            if self._is_order_not_found_error(error_text):
+                self.logger().debug(f"The order {order_id} does not exist on Hyperliquid Perpetuals. "
+                                    f"No cancelation needed.")
+                await self._order_tracker.process_order_not_found(order_id)
+                raise IOError(error_text)
+            # Any other venue-level cancel error is NOT proof the order is gone.
+            # Evicting a still-live order from tracking here would let guard
+            # reconciliation "succeed" at zero open orders while a real order
+            # rests on the book — the one outcome the guard must prevent.
+            record_cancel_failure(self, "IOError", f"Cancel rejected for {order_id}: {error_text}")
+            raise IOError(error_text)
         if self._is_successful_cancel_status(status):
             return True
         record_cancel_failure(self, "IOError", f"Unexpected cancel response for {order_id}: {cancel_result}")
@@ -671,15 +679,73 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
     # === Orders placing ===
 
+    # Venue phrases that prove a cancel target no longer exists. Anything else
+    # must be treated as a cancel FAILURE (telemetry -> gate + reconcile), not
+    # as order-not-found.
+    _CANCEL_NOT_FOUND_MARKERS = (
+        "never existed",
+        "already canceled",
+        "already cancelled",
+        "already filled",
+        "not found",
+        "does not exist",
+        "unknown order",
+    )
+
+    @classmethod
+    def _is_order_not_found_error(cls, message: str) -> bool:
+        text = (message or "").lower()
+        return any(marker in text for marker in cls._CANCEL_NOT_FOUND_MARKERS)
+
     def _runtime_quoting_enabled(self) -> bool:
-        return bool(getattr(self, "_hb_runtime_quoting_enabled", True))
+        # Fail-closed default: quoting stays off until the runtime connectivity
+        # guard stamps the connector on its first tick. A bot running without
+        # the guard (or before its first evaluation) must not quote.
+        return bool(getattr(self, "_hb_runtime_quoting_enabled", False))
 
-    def _gate_allows(self, position_action: Optional[PositionAction] = None) -> bool:
+    def _gate_allows(self,
+                     position_action: Optional[PositionAction] = None,
+                     trading_pair: Optional[str] = None,
+                     trade_type: Optional[TradeType] = None,
+                     amount: Optional[Decimal] = None) -> bool:
+        if self._runtime_quoting_enabled():
+            return True
         # Fail-closed: only an explicit CLOSE (reduce-only) may bypass the gate.
-        return self._runtime_quoting_enabled() or position_action == PositionAction.CLOSE
+        if position_action == PositionAction.CLOSE:
+            return True
+        # Reduce-by-netting: the base-image PositionExecutor sends closes as
+        # PositionAction.OPEN on ONEWAY venues (a reduce-only tag gets rejected
+        # when opposite-side executors net the position first). Such a close is
+        # still position-reducing in intent, so let it through when the tracked
+        # net position proves it only reduces exposure.
+        if trading_pair is not None and trade_type is not None and amount is not None:
+            return self._order_reduces_exposure(trading_pair, trade_type, amount)
+        return False
 
-    def _ensure_runtime_quoting_enabled(self, position_action: Optional[PositionAction] = None) -> None:
-        if not self._gate_allows(position_action):
+    def _order_reduces_exposure(self, trading_pair: str, trade_type: TradeType, amount: Decimal) -> bool:
+        try:
+            perpetual_trading = getattr(self, "_perpetual_trading", None)
+            account_positions = getattr(perpetual_trading, "account_positions", {}) or {}
+            net = Decimal("0")
+            for position in account_positions.values():
+                if getattr(position, "trading_pair", None) == trading_pair:
+                    net += Decimal(str(getattr(position, "amount", 0) or 0))
+            order_amount = Decimal(str(amount))
+        except Exception:
+            return False
+        if net > 0 and trade_type == TradeType.SELL:
+            return order_amount <= net
+        if net < 0 and trade_type == TradeType.BUY:
+            return order_amount <= abs(net)
+        return False
+
+    def _ensure_runtime_quoting_enabled(self,
+                                        position_action: Optional[PositionAction] = None,
+                                        trading_pair: Optional[str] = None,
+                                        trade_type: Optional[TradeType] = None,
+                                        amount: Optional[Decimal] = None) -> None:
+        if not self._gate_allows(position_action, trading_pair=trading_pair,
+                                 trade_type=trade_type, amount=amount):
             raise IOError("Quoting disabled by runtime connectivity guard")
 
     def buy(self,
@@ -698,7 +764,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
 
         :return: the id assigned by the connector to the order (the client id)
         """
-        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"))
+        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"),
+                                             trading_pair=trading_pair,
+                                             trade_type=TradeType.BUY,
+                                             amount=amount)
         order_id = get_new_client_order_id(
             is_buy=True,
             trading_pair=trading_pair,
@@ -736,7 +805,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
         :param price: the order price
         :return: the id assigned by the connector to the order (the client id)
         """
-        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"))
+        self._ensure_runtime_quoting_enabled(kwargs.get("position_action"),
+                                             trading_pair=trading_pair,
+                                             trade_type=TradeType.SELL,
+                                             amount=amount)
         order_id = get_new_client_order_id(
             is_buy=False,
             trading_pair=trading_pair,
@@ -771,7 +843,10 @@ class HyperliquidPerpetualDerivative(PerpetualDerivativePyBase):
             position_action: PositionAction = PositionAction.NIL,
             **kwargs,
     ) -> Tuple[str, float]:
-        self._ensure_runtime_quoting_enabled(position_action)
+        self._ensure_runtime_quoting_enabled(position_action,
+                                             trading_pair=trading_pair,
+                                             trade_type=trade_type,
+                                             amount=amount)
 
         coin = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         param_order_type = {"limit": {"tif": "Gtc"}}

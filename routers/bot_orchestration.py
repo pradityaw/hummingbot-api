@@ -179,7 +179,7 @@ def _read_bot_orders_from_sqlite(bot_name: str, active_only: bool, limit: int) -
     }
 
 
-def _validate_deployment_connector_names(controller_config_names: list[str]) -> None:
+def _collect_controller_connector_names(controller_config_names: list[str]) -> set[str]:
     connector_names: set[str] = set()
     for controller in controller_config_names:
         config_name = controller if controller.endswith(".yml") else f"{controller}.yml"
@@ -191,7 +191,39 @@ def _validate_deployment_connector_names(controller_config_names: list[str]) -> 
                 detail=f"Controller configuration '{config_name}' not found",
             )
         connector_names.update(extract_connector_names_from_mapping(config))
+    return connector_names
 
+
+def _validate_deployment_connector_names(controller_config_names: list[str]) -> None:
+    connector_names = _collect_controller_connector_names(controller_config_names)
+    try:
+        validate_testnet_connectors(connector_names)
+    except MainnetConnectorBlockedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _validate_script_config_connector_names(script_config: Optional[str]) -> None:
+    """
+    Mainnet guard for deploy-v2-script and MQTT start-bot: extract connector
+    names from the script config (and any controller configs it references)
+    and enforce the testnet-only policy. A referenced config that cannot be
+    read fails closed (400) — an unverifiable config is not deployable.
+    """
+    if not script_config:
+        return
+    config_name = script_config if script_config.endswith(".yml") else f"{script_config}.yml"
+    try:
+        script_cfg = fs_util.read_yaml_file(f"conf/scripts/{config_name}")
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Script configuration '{config_name}' not found",
+        )
+    connector_names = extract_connector_names_from_mapping(script_cfg)
+    controllers = script_cfg.get("controllers_config") or []
+    if isinstance(controllers, str):
+        controllers = [controllers]
+    connector_names.update(_collect_controller_connector_names(list(controllers)))
     try:
         validate_testnet_connectors(connector_names)
     except MainnetConnectorBlockedError as exc:
@@ -494,6 +526,7 @@ async def start_bot(
     Returns:
         Dictionary with status and response from bot start operation
     """
+    _validate_script_config_connector_names(action.conf)
     response = await bots_manager.start_bot(
         action.bot_name, log_level=action.log_level, script=action.script,
         conf=action.conf, async_backend=action.async_backend
@@ -1051,6 +1084,8 @@ async def deploy_v2_controllers(
             script_config_content["max_global_drawdown_quote"] = deployment.max_global_drawdown_quote
         if deployment.max_controller_drawdown_quote is not None:
             script_config_content["max_controller_drawdown_quote"] = deployment.max_controller_drawdown_quote
+        if deployment.max_daily_loss_quote is not None:
+            script_config_content["max_daily_loss_quote"] = deployment.max_daily_loss_quote
 
         # Save the script config to the scripts directory
         scripts_dir = os.path.join("conf", "scripts")
@@ -1125,6 +1160,8 @@ async def deploy_v2_script(
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         unique_instance_name = f"{deployment.instance_name}-{timestamp}"
 
+        _validate_script_config_connector_names(deployment.script_config)
+
         # Update deployment with unique name
         deployment.instance_name = unique_instance_name
 
@@ -1155,6 +1192,8 @@ async def deploy_v2_script(
 
         return response
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error deploying V2 script: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

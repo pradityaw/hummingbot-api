@@ -363,6 +363,20 @@ class RuntimeConnectivityGuard:
             if state != ConnectivityState.HARD_DISCONNECTED:
                 state = ConnectivityState.DEGRADED_UNSAFE
             reason_parts.append("user_stream_stale")
+        # Fail-closed telemetry preconditions (F5): never quote on a connector
+        # whose runtime telemetry is absent (unpatched image) or has not yet
+        # produced a single order-book / user-stream update. With an unpatched
+        # connector every status reads "unknown" and all staleness checks skip,
+        # which previously evaluated as HEALTHY.
+        telemetry_missing = connector is not None and not hasattr(connector, "_hb_runtime_connectivity")
+        if telemetry_missing:
+            if state != ConnectivityState.HARD_DISCONNECTED:
+                state = ConnectivityState.DEGRADED_UNSAFE
+            reason_parts.append("runtime_telemetry_missing")
+        elif connector is not None and (last_order_book_update is None or last_user_stream_update is None):
+            if state != ConnectivityState.HARD_DISCONNECTED:
+                state = ConnectivityState.DEGRADED_UNSAFE
+            reason_parts.append("runtime_telemetry_unseen")
         if rest_failures >= self.thresholds.rest_failure_unsafe_threshold:
             if state != ConnectivityState.HARD_DISCONNECTED:
                 state = ConnectivityState.DEGRADED_UNSAFE
