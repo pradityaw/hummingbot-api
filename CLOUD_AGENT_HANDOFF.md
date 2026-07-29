@@ -1,8 +1,10 @@
 # Cloud Agent Handoff — Hyperliquid Recovery Hardening
 
+> **⚠️ SUPERSEDED SNAPSHOT (2026-07-07)** — This handoff is a historical record of the 2026-07-07 deploy. Live bot identity, watchdog/auto-restart state, test counts, and current blockers are superseded by `/Users/dubski/Projects/hyperliquid-condor-mm/docs/PROJECT_STATUS.md` (repo: `hyperliquid-condor-mm`, path `docs/PROJECT_STATUS.md`). Examples below referencing the Jul 7 bot (`hl-testnet-pmm-20260707-113533-20260707-113533`) are historical; the current live bot is **`hl-testnet-pmm-20260724-191456-20260724-191456`** (the "Jul 24 bot"). **Verify live identity in `PROJECT_STATUS.md` before running any command from this document.**
+
 Date: 2026-07-07
 Branch: `cursor-hyperliquid-recovery-hardening`
-Status: **Fixes #3/#6 committed + live. New bot `hl-testnet-pmm-20260707-113533-20260707-113533` HEALTHY, RESUME_READY, spread guard armed (0.01)**
+Status: **Fixes #3/#6 committed + live. New bot `hl-testnet-pmm-20260707-113533-20260707-113533` HEALTHY, RESUME_READY, spread guard armed (0.01)** *(superseded — see banner above)*
 
 ---
 
